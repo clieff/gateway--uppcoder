@@ -2,14 +2,19 @@ import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+console.log(
+  '[Supabase] Préfixe de SUPABASE_SERVICE_ROLE_KEY (10 premiers caractères):',
+  supabaseKey ? supabaseKey.slice(0, 10) : 'absente',
+);
 
 if (!supabaseUrl || !supabaseKey) {
-  throw new Error('Définissez SUPABASE_URL et une clé Supabase serveur (recommandé : SUPABASE_SERVICE_ROLE_KEY).');
+  throw new Error('Définissez SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY dans l’environnement du gateway.');
 }
 
 // Cette clé reste uniquement côté serveur. Ne jamais utiliser NEXT_PUBLIC_ avec une clé privilégiée.
-const supabase = createClient(supabaseUrl, supabaseKey, {
+export const supabase = createClient(supabaseUrl, supabaseKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
