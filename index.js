@@ -6,7 +6,7 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   normalizeMessageContent,
 } from "@whiskeysockets/baileys";
-import { timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import axios from "axios";
 import pino from "pino";
 import QRCode from "qrcode";
@@ -25,7 +25,6 @@ import {
 
 const WEBHOOK_URL = process.env.VERCEL_WEBHOOK_URL;
 const GATEWAY_API_SECRET = process.env.GATEWAY_API_SECRET;
-const QR_VIEW_PASSWORD = process.env.QR_VIEW_PASSWORD || GATEWAY_API_SECRET;
 const BUSINESS_JID = normalizeJid(process.env.BUSINESS_JID);
 const PORT = Number(
   process.env.PORT ||
@@ -45,6 +44,8 @@ const chatQueues = new Map();
 let socket;
 let reconnectTimer;
 let currentQr;
+let currentQrAccessToken;
+let currentQrAccessTokenCreatedAt = 0;
 
 if (!WEBHOOK_URL || !GATEWAY_API_SECRET || !BUSINESS_JID) {
   throw new Error(
@@ -108,22 +109,17 @@ function isDirectChat(jid) {
   );
 }
 
-function isQrViewerAuthorized(req) {
-  const match = /^Basic\s+(.+)$/i.exec(req.headers.authorization || "");
-  if (!match) return false;
-
-  let credentials;
-  try {
-    credentials = Buffer.from(match[1], "base64").toString("utf8");
-  } catch {
+function isQrLinkAuthorized(suppliedToken) {
+  if (
+    !currentQrAccessToken ||
+    Date.now() - currentQrAccessTokenCreatedAt > 2 * 60_000 ||
+    typeof suppliedToken !== "string"
+  ) {
     return false;
   }
 
-  const separator = credentials.indexOf(":");
-  if (separator < 0 || credentials.slice(0, separator) !== "qr") return false;
-
-  const suppliedPassword = Buffer.from(credentials.slice(separator + 1));
-  const expectedPassword = Buffer.from(QR_VIEW_PASSWORD || "");
+  const suppliedPassword = Buffer.from(suppliedToken);
+  const expectedPassword = Buffer.from(currentQrAccessToken);
   return (
     suppliedPassword.length === expectedPassword.length &&
     timingSafeEqual(suppliedPassword, expectedPassword)
@@ -604,18 +600,19 @@ function readJson(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === "GET" && req.url === "/qr") {
-    if (!isQrViewerAuthorized(req)) {
-      res.writeHead(401, {
-        "WWW-Authenticate": 'Basic realm="Baileys QR", charset="UTF-8"',
-        "Cache-Control": "no-store",
-      });
-      res.end("Authentification requise.");
-      return;
-    }
+  const requestUrl = new URL(req.url || "/", "http://localhost");
+  if (req.method === "GET" && requestUrl.pathname === "/qr") {
     if (!currentQr) {
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end("Aucun QR code WhatsApp n’est actuellement disponible.");
+      return;
+    }
+    if (!isQrLinkAuthorized(requestUrl.searchParams.get("token"))) {
+      res.writeHead(401, {
+        "content-type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      res.end("Lien QR expiré ou invalide. Utilisez le lien le plus récent des logs.");
       return;
     }
 
@@ -696,6 +693,8 @@ async function connectToWhatsApp() {
   socket.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       currentQr = qr;
+      currentQrAccessToken = randomBytes(32).toString("base64url");
+      currentQrAccessTokenCreatedAt = Date.now();
       const publicBaseUrl = (
         process.env.RENDER_EXTERNAL_URL ||
         process.env.GATEWAY_PUBLIC_URL ||
@@ -704,7 +703,7 @@ async function connectToWhatsApp() {
       ).replace(/\/+$/, "");
       if (publicBaseUrl) {
         logger.info(
-          `QR code temporaire : ${publicBaseUrl}/qr (utilisateur : qr; mot de passe : QR_VIEW_PASSWORD, ou GATEWAY_API_SECRET par défaut).`,
+          `QR code temporaire : ${publicBaseUrl}/qr?token=${currentQrAccessToken}`,
         );
       } else {
         logger.info(
@@ -714,11 +713,15 @@ async function connectToWhatsApp() {
     }
     if (connection === "open") {
       currentQr = undefined;
+      currentQrAccessToken = undefined;
+      currentQrAccessTokenCreatedAt = 0;
       logger.info({ jid: socket.user?.id }, "WhatsApp Business connecté.");
       void refreshCatalog({ force: true });
     }
     if (connection === "close") {
       currentQr = undefined;
+      currentQrAccessToken = undefined;
+      currentQrAccessTokenCreatedAt = 0;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const numericStatusCode = Number(statusCode);
       const shouldReconnect =
