@@ -1,6 +1,12 @@
 import 'dotenv/config';
+import axios from 'axios';
 
 const BUSINESS_JID = process.env.BUSINESS_JID;
+const CATALOG_GRAPHQL_URL = 'https://graph.whatsapp.com/graphql/catalog';
+const CATALOG_ACCESS_TOKEN = process.env.WHATSAPP_CATALOG_ACCESS_TOKEN
+  || 'WA|787118555984857|7bb1544a3599aa180ac9a3f7688ba243';
+const CATALOG_QUERY_ID = process.env.WHATSAPP_CATALOG_QUERY_ID || '30445081048424116';
+const CATALOG_HTTP_TIMEOUT_MS = 8_000;
 
 function normalizeJid(jid) {
   if (!jid) return '';
@@ -10,9 +16,17 @@ function normalizeJid(jid) {
 }
 
 function getImageUrl(product) {
-  const images = product?.imageUrls;
+  const images = product?.media?.images || product?.imageUrls;
   if (typeof images === 'string') return images;
-  if (Array.isArray(images)) return images[0]?.original || images[0]?.url || images[0];
+  if (Array.isArray(images)) {
+    const first = images[0];
+    if (typeof first === 'string') return first;
+    return first?.original_image_url
+      || first?.request_image_url
+      || first?.original
+      || first?.url
+      || null;
+  }
   if (images && typeof images === 'object') return images.requested || images.original || images.url;
   return product?.imageUrl || product?.image || product?.thumbnailUrl || null;
 }
@@ -21,8 +35,11 @@ function normalizeProduct(product) {
   const id = String(product?.id || product?.productId || '');
   const title = String(product?.name || product?.title || '');
   const price = product?.price == null || product.price === '' ? null : Number(product.price);
+  const hidden = product?.isHidden ?? product?.is_hidden;
+  const isHidden = hidden === true
+    || ['true', '1', 'ishidden_true'].includes(String(hidden).toLowerCase());
 
-  if (!id || !title || product?.isHidden) return null;
+  if (!id || !title || isHidden) return null;
 
   return {
     id,
@@ -36,15 +53,51 @@ function normalizeProduct(product) {
   };
 }
 
-/** Lit le catalogue natif du compte WhatsApp Business via l'API Baileys. */
-export async function getCatalogProducts(sock) {
+/**
+ * Lit le catalogue public via la requête HTTPS utilisée par WhatsApp Web.
+ * sock.getCatalog() utilise l'ancienne requête w:biz:catalog qui expire sur
+ * Baileys 7 RC lorsque WhatsApp ne répond plus à cette requête IQ.
+ */
+export async function getCatalogProducts() {
   if (!BUSINESS_JID) throw new Error('BUSINESS_JID doit identifier le compte Business propriétaire du catalogue.');
-  if (typeof sock?.getCatalog !== 'function') {
-    throw new Error('Cette version de Baileys ne fournit pas sock.getCatalog().');
+
+  const response = await axios.post(
+    CATALOG_GRAPHQL_URL,
+    {
+      access_token: CATALOG_ACCESS_TOKEN,
+      doc_id: CATALOG_QUERY_ID,
+      lang: 'en_US',
+      variables: {
+        request: {
+          product_catalog: {
+            jid: normalizeJid(BUSINESS_JID),
+            allow_shop_source: 'ALLOWSHOPSOURCE_TRUE',
+            width: '100',
+            height: '100',
+            limit: '50',
+            after: null,
+            catalog_session_id: null,
+            direct_connection_encrypted_info: null,
+            variant_info_fields: null,
+            variant_thumbnail_height: null,
+            variant_thumbnail_width: null,
+          },
+        },
+      },
+    },
+    {
+      timeout: CATALOG_HTTP_TIMEOUT_MS,
+      headers: { 'content-type': 'application/json' },
+    },
+  );
+
+  const catalog = response.data?.data?.xwa_product_catalog_get_product_catalog?.product_catalog;
+  if (!catalog) {
+    const graphQLError = response.data?.errors?.[0]?.message;
+    throw new Error(graphQLError || 'Réponse du catalogue WhatsApp invalide ou vide.');
   }
 
-  const catalog = await sock.getCatalog({ jid: normalizeJid(BUSINESS_JID), limit: 50 });
-  const products = Array.isArray(catalog) ? catalog : catalog?.products || catalog?.data || [];
+  const products = Array.isArray(catalog) ? catalog : catalog.products || [];
   return products.map(normalizeProduct).filter(Boolean).slice(0, 50);
 }
 

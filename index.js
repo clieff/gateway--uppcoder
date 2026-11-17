@@ -45,6 +45,7 @@ function normalizeWebhookUrl(value) {
 
 const WEBHOOK_URL = normalizeWebhookUrl(process.env.VERCEL_WEBHOOK_URL);
 const GATEWAY_API_SECRET = process.env.GATEWAY_API_SECRET;
+const VERCEL_AUTOMATION_BYPASS_SECRET = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
 const BUSINESS_JID = normalizeJid(process.env.BUSINESS_JID);
 const PORT = Number(
   process.env.PORT ||
@@ -66,6 +67,14 @@ const catalogCache = {
 const chatQueues = new Map();
 let socket;
 let reconnectTimer;
+
+function safeErrorDetails(error) {
+  return {
+    message: error?.message || String(error),
+    code: error?.code,
+    status: error?.response?.status,
+  };
+}
 
 if (!WEBHOOK_URL || !GATEWAY_API_SECRET || !BUSINESS_JID) {
   throw new Error(
@@ -139,7 +148,7 @@ async function refreshCatalog({ force = false } = {}) {
     if (now < catalogCache.retryAfter) return catalogCache.products;
 
     const catalogRead = Promise.resolve()
-      .then(() => getCatalogProducts(socket))
+      .then(() => getCatalogProducts())
       .then((products) => {
         catalogCache.products = products;
         catalogCache.refreshedAt = Date.now();
@@ -164,8 +173,8 @@ async function refreshCatalog({ force = false } = {}) {
         catalogCache.retryAfter = Date.now() + 60_000;
         catalogCache.refreshFailed = true;
         logger.warn(
-          { err: error, cachedProducts: catalogCache.products.length },
-          "Catalogue natif indisponible; le dernier cache est conservé.",
+          { err: safeErrorDetails(error), cachedProducts: catalogCache.products.length },
+          "Catalogue WhatsApp indisponible; le dernier cache est conservé.",
         );
         return [];
       })
@@ -513,12 +522,27 @@ async function processLiveMessage(message, jid) {
       },
       {
         timeout: 55_000,
-        headers: { Authorization: `Bearer ${GATEWAY_API_SECRET}` },
+        headers: {
+          Authorization: `Bearer ${GATEWAY_API_SECRET}`,
+          ...(VERCEL_AUTOMATION_BYPASS_SECRET
+            ? { "x-vercel-protection-bypass": VERCEL_AUTOMATION_BYPASS_SECRET }
+            : {}),
+        },
       },
     );
     await sendAction(jid, response.data, products);
   } catch (error) {
-    logger.error({ err: error, jid }, "Webhook Vercel indisponible.");
+    logger.error(
+      {
+        err: safeErrorDetails(error),
+        responseMessage:
+          error?.response?.data?.protection?.error ||
+          error?.response?.data?.error?.message ||
+          error?.response?.data?.message,
+        jid,
+      },
+      "Webhook Vercel indisponible.",
+    );
     if (!catalogNoticeSent) {
       const text =
         "Je rencontre un problème technique pour le moment. Votre message a bien été reçu ; nous reviendrons vers vous dès que possible.";
