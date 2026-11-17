@@ -6,10 +6,8 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   normalizeMessageContent,
 } from "@whiskeysockets/baileys";
-import { randomBytes, timingSafeEqual } from "node:crypto";
 import axios from "axios";
 import pino from "pino";
-import QRCode from "qrcode";
 import { saveMessage, saveMessages, updateContact } from "./db.js";
 import {
   clearSupabaseAuthState,
@@ -43,9 +41,6 @@ const catalogCache = {
 const chatQueues = new Map();
 let socket;
 let reconnectTimer;
-let currentQr;
-let currentQrAccessToken;
-let currentQrAccessTokenCreatedAt = 0;
 
 if (!WEBHOOK_URL || !GATEWAY_API_SECRET || !BUSINESS_JID) {
   throw new Error(
@@ -106,23 +101,6 @@ function isDirectChat(jid) {
   return (
     typeof jid === "string" &&
     (jid.endsWith("@s.whatsapp.net") || jid.endsWith("@lid"))
-  );
-}
-
-function isQrLinkAuthorized(suppliedToken) {
-  if (
-    !currentQrAccessToken ||
-    Date.now() - currentQrAccessTokenCreatedAt > 2 * 60_000 ||
-    typeof suppliedToken !== "string"
-  ) {
-    return false;
-  }
-
-  const suppliedPassword = Buffer.from(suppliedToken);
-  const expectedPassword = Buffer.from(currentQrAccessToken);
-  return (
-    suppliedPassword.length === expectedPassword.length &&
-    timingSafeEqual(suppliedPassword, expectedPassword)
   );
 }
 
@@ -600,43 +578,6 @@ function readJson(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const requestUrl = new URL(req.url || "/", "http://localhost");
-  if (req.method === "GET" && requestUrl.pathname === "/qr") {
-    if (!currentQr) {
-      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-      res.end("Aucun QR code WhatsApp n’est actuellement disponible.");
-      return;
-    }
-    if (!isQrLinkAuthorized(requestUrl.searchParams.get("token"))) {
-      res.writeHead(401, {
-        "content-type": "text/plain; charset=utf-8",
-        "Cache-Control": "no-store",
-      });
-      res.end("Lien QR expiré ou invalide. Utilisez le lien le plus récent des logs.");
-      return;
-    }
-
-    try {
-      const image = await QRCode.toBuffer(currentQr, {
-        type: "png",
-        width: 360,
-        margin: 2,
-        errorCorrectionLevel: "M",
-      });
-      res.writeHead(200, {
-        "content-type": "image/png",
-        "Cache-Control": "no-store, max-age=0",
-        Pragma: "no-cache",
-      });
-      res.end(image);
-    } catch (error) {
-      logger.error({ err: error }, "Impossible de générer l’image du QR code.");
-      res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-      res.end("Impossible de générer le QR code.");
-    }
-    return;
-  }
-
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
@@ -671,6 +612,7 @@ server.listen(PORT, "0.0.0.0", () =>
 
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useSupabaseAuthState();
+  let pairingCodeRequested = false;
   socket = makeWASocket({
     auth: {
       creds: state.creds,
@@ -691,37 +633,35 @@ async function connectToWhatsApp() {
     );
   });
   socket.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      currentQr = qr;
-      currentQrAccessToken = randomBytes(32).toString("base64url");
-      currentQrAccessTokenCreatedAt = Date.now();
-      const publicBaseUrl = (
-        process.env.RENDER_EXTERNAL_URL ||
-        process.env.GATEWAY_PUBLIC_URL ||
-        process.env.GATEWAY_API_URL ||
-        ""
-      ).replace(/\/+$/, "");
-      if (publicBaseUrl) {
-        logger.info(
-          `QR code temporaire : ${publicBaseUrl}/qr?token=${currentQrAccessToken}`,
+    if (qr && !state.creds.registered && !pairingCodeRequested) {
+      pairingCodeRequested = true;
+      const phoneNumber = BUSINESS_JID.split("@")[0].replace(/\D/g, "");
+      if (!/^\d{8,15}$/.test(phoneNumber)) {
+        logger.error(
+          "BUSINESS_JID doit contenir un numéro international valide pour le code d’appairage.",
         );
       } else {
         logger.info(
-          "QR code reçu. Définissez GATEWAY_PUBLIC_URL pour obtenir un lien complet vers /qr.",
+          "Demande d’un code d’appairage WhatsApp. Sur le téléphone, choisissez Appareils connectés puis Lier avec un numéro de téléphone.",
         );
+        void socket
+          .requestPairingCode(phoneNumber)
+          .then((code) => {
+            logger.info({ pairingCode: code }, "CODE D’APPAIRAGE WHATSAPP");
+          })
+          .catch((error) => {
+            logger.error(
+              { err: error },
+              "Erreur lors de la génération du code d’appairage.",
+            );
+          });
       }
     }
     if (connection === "open") {
-      currentQr = undefined;
-      currentQrAccessToken = undefined;
-      currentQrAccessTokenCreatedAt = 0;
       logger.info({ jid: socket.user?.id }, "WhatsApp Business connecté.");
       void refreshCatalog({ force: true });
     }
     if (connection === "close") {
-      currentQr = undefined;
-      currentQrAccessToken = undefined;
-      currentQrAccessTokenCreatedAt = 0;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const numericStatusCode = Number(statusCode);
       const shouldReconnect =
