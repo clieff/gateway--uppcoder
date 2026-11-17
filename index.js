@@ -21,7 +21,29 @@ import {
   sendProductList,
 } from "./catalog.js";
 
-const WEBHOOK_URL = process.env.VERCEL_WEBHOOK_URL;
+function normalizeWebhookUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+
+  const configuredUrl = value.trim();
+  const candidate = /^https?:\/\//i.test(configuredUrl)
+    ? configuredUrl
+    : `https://${configuredUrl}`;
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(candidate);
+  } catch {
+    throw new Error("VERCEL_WEBHOOK_URL n’est pas une URL valide.");
+  }
+
+  if (!["http:", "https:"].includes(parsedUrl.protocol) || !parsedUrl.hostname) {
+    throw new Error("VERCEL_WEBHOOK_URL doit être une URL HTTP ou HTTPS valide.");
+  }
+
+  return parsedUrl.toString();
+}
+
+const WEBHOOK_URL = normalizeWebhookUrl(process.env.VERCEL_WEBHOOK_URL);
 const GATEWAY_API_SECRET = process.env.GATEWAY_API_SECRET;
 const BUSINESS_JID = normalizeJid(process.env.BUSINESS_JID);
 const PORT = Number(
@@ -448,7 +470,7 @@ async function processLiveMessage(message, jid) {
       );
       return;
     }
-    if (catalogCache.refreshFailed) {
+    if (catalogCache.refreshFailed && !catalogCache.refreshTimedOut) {
       await sendCatalogUnavailableNotice(jid);
       return;
     }
