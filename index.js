@@ -65,14 +65,40 @@ const catalogCache = {
   refreshFailed: false,
 };
 const chatQueues = new Map();
+const recentInboundMessageIds = new Map();
+const INBOUND_MESSAGE_DEDUP_TTL_MS = 10 * 60_000;
+const MAX_RECENT_INBOUND_MESSAGE_IDS = 5_000;
+const NON_USER_MESSAGE_TYPES = new Set([
+  "messageContextInfo",
+  "protocolMessage",
+  "senderKeyDistributionMessage",
+  "reactionMessage",
+  "pollUpdateMessage",
+  "keepInChatMessage",
+  "eventNotificationMessage",
+  "call",
+]);
 let socket;
 let reconnectTimer;
 
 function safeErrorDetails(error) {
+  const responseData = error?.response?.data;
+  const responseMessage =
+    responseData?.protection?.error ||
+    responseData?.error?.message ||
+    responseData?.message;
+
   return {
     message: error?.message || String(error),
     code: error?.code,
     status: error?.response?.status,
+    responseMessage:
+      typeof responseMessage === "string"
+        ? responseMessage.slice(0, 500)
+        : undefined,
+    vercelRequestId:
+      error?.response?.headers?.["x-vercel-id"] ||
+      error?.response?.headers?.["x-vercel-error"],
   };
 }
 
@@ -105,9 +131,46 @@ function messageBody(message) {
     content.documentMessage?.caption ||
     content.productMessage?.product?.title ||
     content.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    content.buttonsResponseMessage?.selectedDisplayText ||
+    content.buttonsResponseMessage?.selectedButtonId ||
+    content.templateButtonReplyMessage?.selectedDisplayText ||
+    content.templateButtonReplyMessage?.selectedId ||
+    content.interactiveResponseMessage?.body?.text ||
     content.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson ||
     ""
   );
+}
+
+function isNonUserMessageWithoutText(message) {
+  const contentTypes = Object.keys(messageContent(message)).filter(
+    (type) => type !== "messageContextInfo",
+  );
+  return (
+    contentTypes.length === 0 ||
+    contentTypes.every((type) => NON_USER_MESSAGE_TYPES.has(type))
+  );
+}
+
+function claimInboundMessageId(message) {
+  const messageId = message?.key?.id;
+  if (!messageId) return true;
+
+  const now = Date.now();
+  for (const [id, expiresAt] of recentInboundMessageIds) {
+    if (expiresAt > now) break;
+    recentInboundMessageIds.delete(id);
+  }
+
+  if (recentInboundMessageIds.has(messageId)) return false;
+  if (recentInboundMessageIds.size >= MAX_RECENT_INBOUND_MESSAGE_IDS) {
+    const oldestId = recentInboundMessageIds.keys().next().value;
+    if (oldestId) recentInboundMessageIds.delete(oldestId);
+  }
+  recentInboundMessageIds.set(
+    messageId,
+    now + INBOUND_MESSAGE_DEDUP_TTL_MS,
+  );
+  return true;
 }
 
 function getSelectedProductId(message) {
@@ -447,6 +510,28 @@ async function sendAction(jid, action, products) {
 }
 
 async function processLiveMessage(message, jid) {
+  if (message.key?.fromMe) return;
+  if (!claimInboundMessageId(message)) {
+    logger.debug(
+      { messageId: message.key?.id, jid },
+      "Événement WhatsApp dupliqué ignoré.",
+    );
+    return;
+  }
+
+  const body = messageBody(message).trim().slice(0, 16000);
+  if (!body && isNonUserMessageWithoutText(message)) {
+    logger.debug(
+      {
+        jid,
+        messageId: message.key?.id,
+        messageTypes: Object.keys(messageContent(message)),
+      },
+      "Événement WhatsApp sans contenu utilisateur ignoré.",
+    );
+    return;
+  }
+
   let inserted = true;
   try {
     inserted = await saveInbound(message, jid);
@@ -457,7 +542,7 @@ async function processLiveMessage(message, jid) {
       "Échec de sauvegarde du message entrant; le traitement continue vers Vercel.",
     );
   }
-  if (!inserted || message.key?.fromMe) return;
+  if (!inserted) return;
 
   const selectedProductId = getSelectedProductId(message);
   if (selectedProductId) {
@@ -485,10 +570,9 @@ async function processLiveMessage(message, jid) {
     }
   }
 
-  const body = messageBody(message).trim().slice(0, 16000);
   if (!body) {
     const text =
-      "Je n’ai pas pu lire ce message. Pouvez-vous m’écrire votre demande en texte ?";
+      "Je peux traiter les messages écrits pour le moment. Merci de m’envoyer votre demande en texte.";
     const sent = await socket.sendMessage(jid, { text });
     await saveOutbound(jid, sent, text, "conversation");
     return;
@@ -531,10 +615,6 @@ async function processLiveMessage(message, jid) {
     logger.error(
       {
         err: safeErrorDetails(error),
-        responseMessage:
-          error?.response?.data?.protection?.error ||
-          error?.response?.data?.error?.message ||
-          error?.response?.data?.message,
         jid,
       },
       "Webhook Vercel indisponible.",
