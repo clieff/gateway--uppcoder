@@ -30,11 +30,14 @@ const PORT = Number(
     process.env.GATEWAY_PORT ||
     3000,
 );
+const CATALOG_RESPONSE_TIMEOUT_MS = 3_000;
+const CATALOG_BACKGROUND_TIMEOUT_MS = 60_000;
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const catalogCache = {
   products: [],
   refreshedAt: 0,
   refreshPromise: null,
+  refreshTimedOut: false,
   retryAfter: 0,
   refreshFailed: false,
 };
@@ -108,48 +111,77 @@ async function refreshCatalog({ force = false } = {}) {
   const now = Date.now();
   if (!force && now - catalogCache.refreshedAt < 60_000)
     return catalogCache.products;
-  if (catalogCache.refreshPromise) return catalogCache.refreshPromise;
-  if (now < catalogCache.retryAfter) return catalogCache.products;
+  if (catalogCache.refreshPromise && catalogCache.refreshTimedOut) return [];
 
-  const pending = (async () => {
-    let timeout;
-    try {
-      const result = await Promise.race([
-        getCatalogProducts(socket),
-        new Promise((_, reject) => {
-          timeout = setTimeout(
-            () =>
-              reject(
-                new Error("Délai maximal de lecture du catalogue dépassé."),
-              ),
-            30_000,
-          );
-        }),
-      ]);
-      catalogCache.products = result;
-      catalogCache.refreshedAt = Date.now();
-      catalogCache.retryAfter = 0;
-      catalogCache.refreshFailed = false;
-      return result;
-    } catch (error) {
-      catalogCache.retryAfter = Date.now() + 60_000;
-      catalogCache.refreshFailed = true;
-      logger.warn(
-        { err: error, cachedProducts: catalogCache.products.length },
-        "Catalogue natif indisponible; le dernier cache est conservé.",
-      );
-      return catalogCache.products;
-    } finally {
-      clearTimeout(timeout);
-    }
-  })();
-  catalogCache.refreshPromise = pending;
-  try {
-    return await pending;
-  } finally {
-    if (catalogCache.refreshPromise === pending)
-      catalogCache.refreshPromise = null;
+  if (!catalogCache.refreshPromise) {
+    if (now < catalogCache.retryAfter) return catalogCache.products;
+
+    const catalogRead = Promise.resolve()
+      .then(() => getCatalogProducts(socket))
+      .then((products) => {
+        catalogCache.products = products;
+        catalogCache.refreshedAt = Date.now();
+        catalogCache.retryAfter = 0;
+        catalogCache.refreshFailed = false;
+        return products;
+      });
+    let backgroundTimeout;
+    const pending = Promise.race([
+      catalogRead,
+      new Promise((_, reject) => {
+        backgroundTimeout = setTimeout(
+          () =>
+            reject(
+              new Error("Délai maximal de lecture du catalogue dépassé en arrière-plan."),
+            ),
+          CATALOG_BACKGROUND_TIMEOUT_MS,
+        );
+      }),
+    ])
+      .catch((error) => {
+        catalogCache.retryAfter = Date.now() + 60_000;
+        catalogCache.refreshFailed = true;
+        logger.warn(
+          { err: error, cachedProducts: catalogCache.products.length },
+          "Catalogue natif indisponible; le dernier cache est conservé.",
+        );
+        return [];
+      })
+      .finally(() => {
+        clearTimeout(backgroundTimeout);
+        if (catalogCache.refreshPromise === pending) {
+          catalogCache.refreshPromise = null;
+          catalogCache.refreshTimedOut = false;
+        }
+      });
+    catalogCache.refreshPromise = pending;
   }
+
+  const pending = catalogCache.refreshPromise;
+  const timedOut = Symbol("catalog-refresh-timeout");
+  let timeout;
+  const result = await Promise.race([
+    pending,
+    new Promise((resolve) => {
+      timeout = setTimeout(
+        () => resolve(timedOut),
+        CATALOG_RESPONSE_TIMEOUT_MS,
+      );
+    }),
+  ]);
+  clearTimeout(timeout);
+
+  if (result === timedOut) {
+    catalogCache.refreshTimedOut = true;
+    catalogCache.refreshFailed = true;
+    logger.warn(
+      { cachedProducts: catalogCache.products.length },
+      "Catalogue > 3 s; Vercel reçoit le message sans catalogue, l’actualisation continue en arrière-plan.",
+    );
+    return [];
+  }
+
+  return result;
 }
 
 async function saveInbound(message, jid) {
@@ -432,9 +464,10 @@ async function processLiveMessage(message, jid) {
   }
 
   const products = await refreshCatalog();
-  const catalogNoticeSent = catalogCache.refreshFailed
-    ? await sendCatalogUnavailableNotice(jid)
-    : false;
+  const catalogNoticeSent =
+    catalogCache.refreshFailed && !catalogCache.refreshTimedOut
+      ? await sendCatalogUnavailableNotice(jid)
+      : false;
   const publicProducts = products.map(
     ({ id, title, description, price, currency, retailerId }) => ({
       id,
