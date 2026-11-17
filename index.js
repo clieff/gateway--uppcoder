@@ -176,7 +176,7 @@ async function refreshCatalog({ force = false } = {}) {
           { err: safeErrorDetails(error), cachedProducts: catalogCache.products.length },
           "Catalogue WhatsApp indisponible; le dernier cache est conservé.",
         );
-        return [];
+        return catalogCache.products;
       })
       .finally(() => {
         clearTimeout(backgroundTimeout);
@@ -495,10 +495,6 @@ async function processLiveMessage(message, jid) {
   }
 
   const products = await refreshCatalog();
-  const catalogNoticeSent =
-    catalogCache.refreshFailed && !catalogCache.refreshTimedOut
-      ? await sendCatalogUnavailableNotice(jid)
-      : false;
   const publicProducts = products.map(
     ({ id, title, description, price, currency, retailerId }) => ({
       id,
@@ -543,12 +539,10 @@ async function processLiveMessage(message, jid) {
       },
       "Webhook Vercel indisponible.",
     );
-    if (!catalogNoticeSent) {
-      const text =
-        "Je rencontre un problème technique pour le moment. Votre message a bien été reçu ; nous reviendrons vers vous dès que possible.";
-      const sent = await socket.sendMessage(jid, { text });
-      await saveOutbound(jid, sent, text, "conversation");
-    }
+    const text =
+      "Je rencontre un problème technique pour le moment. Votre message a bien été reçu ; nous reviendrons vers vous dès que possible.";
+    const sent = await socket.sendMessage(jid, { text });
+    await saveOutbound(jid, sent, text, "conversation");
   }
 }
 
