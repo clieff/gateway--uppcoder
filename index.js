@@ -622,7 +622,7 @@ async function connectToWhatsApp() {
       ),
     },
     browser: Browsers.ubuntu("Chrome"), // <--- LA CORRECTION EST ICI
-    syncFullHistory: true,
+    syncFullHistory: false,
     markOnlineOnConnect: false,
     logger: logger.child({ component: "baileys" }),
   });
