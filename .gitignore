@@ -2,4 +2,4 @@
 .env.*
 !.env.example
 auth_info_baileys/
-"node_modules/" 
+node_modules/

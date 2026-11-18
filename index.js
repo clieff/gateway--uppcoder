@@ -84,6 +84,7 @@ const catalogCache = {
   refreshFailed: false,
 };
 const replyQueues = new Map();
+const inboundQueues = new Map();
 const recentInboundMessageIds = new Map();
 const INBOUND_MESSAGE_DEDUP_TTL_MS = 10 * 60_000;
 const MAX_RECENT_INBOUND_MESSAGE_IDS = 5_000;
@@ -551,17 +552,20 @@ async function sendAction(jid, action, products, { strict = false } = {}) {
 }
 
 async function handleOptOut(jid) {
+  let text;
   try {
     await setFollowupOptIn(jid, false);
     logger.info({ jid }, "Contact désinscrit des relances.");
+    text =
+      "C’est noté : votre désinscription est enregistrée. Vous ne recevrez plus nos messages de relance. Vous pouvez nous écrire à tout moment.";
   } catch (error) {
     logger.error(
       { err: safeErrorDetails(error), jid },
       "Désinscription du contact non enregistrée.",
     );
+    text =
+      "Votre demande de désinscription n’a pas pu être enregistrée à cause d’un problème technique. Merci de réessayer plus tard ou de contacter notre équipe.";
   }
-  const text =
-    "C’est noté : vous ne recevrez plus nos messages de relance. Vous pouvez nous écrire à tout moment.";
   const sent = await socket.sendMessage(jid, { text });
   await saveOutbound(jid, sent, text, "conversation");
 }
@@ -635,6 +639,26 @@ function enqueueReply(jid, job) {
 
   runInBackground("file de réponse", () => drainReplies(jid, state, job), {
     jid,
+  });
+}
+
+/** Persiste les messages d’un même chat dans l’ordre avant de lancer le cerveau. */
+function enqueueInboundMessage(jid, message) {
+  const previous = inboundQueues.get(jid) || Promise.resolve();
+  const current = previous
+    .catch(() => undefined)
+    .then(() => processLiveMessage(message, jid));
+  inboundQueues.set(jid, current);
+
+  current
+    .finally(() => {
+      if (inboundQueues.get(jid) === current) inboundQueues.delete(jid);
+    })
+    .catch(() => undefined);
+
+  runInBackground("traitement du message reçu", () => current, {
+    jid,
+    messageId: message.key?.id,
   });
 }
 
@@ -980,11 +1004,7 @@ async function connectToWhatsApp() {
         const jid = canonicalContactJid(message);
         if (!isDirectChat(jid) || jid === BUSINESS_JID) continue;
         if (type === "notify" && !message.key?.fromMe) {
-          runInBackground(
-            "traitement du message reçu",
-            () => processLiveMessage(message, jid),
-            { jid, messageId: message.key?.id },
-          );
+          enqueueInboundMessage(jid, message);
         } else {
           void saveInbound(message, jid).catch((error) =>
             logger.error(
