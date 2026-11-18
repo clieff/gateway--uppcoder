@@ -56,6 +56,17 @@ function normalizeProduct(product) {
   };
 }
 
+/** Prix lisible pour les messages texte et les lignes de liste. */
+function formatPrice(product) {
+  if (product?.price == null || product.price === '') return '';
+  const amount = Number(product.price);
+  if (!Number.isFinite(amount)) return '';
+  const formatted = new Intl.NumberFormat('fr-FR', {
+    maximumFractionDigits: 2,
+  }).format(amount);
+  return [formatted, String(product.currency || '')].filter(Boolean).join(' ');
+}
+
 /**
  * Lit le catalogue depuis la table public.products (source de vérité du bot).
  * La requête graph.whatsapp.com/graphql/catalog utilisée par WhatsApp Web a été
@@ -244,7 +255,11 @@ export async function sendProductList(sock, jid, products, message = 'Voici les 
       title: 'Catalogue',
       rows: items.map((product) => ({
         title: product.title.slice(0, 24),
-        description: product.description.slice(0, 72) || undefined,
+        description:
+          [product.description, formatPrice(product)]
+            .filter(Boolean)
+            .join(' — ')
+            .slice(0, 72) || undefined,
         rowId: `product:${product.id}`,
       })),
     }],
@@ -262,4 +277,5 @@ export async function sendCatalogLink(sock, jid, businessJid = BUSINESS_JID, pro
   return sock.sendMessage(jid, { text });
 }
 
-export { normalizeJid };
+// `normalizeProduct` et `formatPrice` sont exportés pour les tests unitaires.
+export { normalizeJid, normalizeProduct, formatPrice };

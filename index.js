@@ -4,13 +4,18 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
   makeCacheableSignalKeyStore,
-  normalizeMessageContent,
 } from "@whiskeysockets/baileys";
 import axios from "axios";
 import pino from "pino";
-import { saveMessage, saveMessages, updateContact } from "./db.js";
+import {
+  saveMessage,
+  saveMessages,
+  setFollowupOptIn,
+  updateContact,
+} from "./db.js";
 import {
   clearSupabaseAuthState,
+  flushAuthState,
   useSupabaseAuthState,
 } from "./auth-state.js";
 import {
@@ -21,6 +26,15 @@ import {
   sendProductList,
   syncCatalogFromWhatsApp,
 } from "./catalog.js";
+import {
+  buildProductText,
+  businessLink,
+  canonicalContactJid,
+  isNonUserMessageWithoutText,
+  isOptOutMessage,
+  messageBody,
+  messageContent,
+} from "./messages.js";
 
 function normalizeWebhookUrl(value) {
   if (typeof value !== "string" || !value.trim()) return null;
@@ -56,6 +70,10 @@ const PORT = Number(
 );
 const CATALOG_RESPONSE_TIMEOUT_MS = 3_000;
 const CATALOG_BACKGROUND_TIMEOUT_MS = 60_000;
+// Le cerveau répond en 2 x 15 s au pire; 45 s laisse une marge sous les 60 s de Vercel.
+const WEBHOOK_TIMEOUT_MS = 45_000;
+const RECONNECT_BASE_MS = 5_000;
+const RECONNECT_MAX_MS = 60_000;
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const catalogCache = {
   products: [],
@@ -65,22 +83,16 @@ const catalogCache = {
   retryAfter: 0,
   refreshFailed: false,
 };
-const chatQueues = new Map();
+const replyQueues = new Map();
 const recentInboundMessageIds = new Map();
 const INBOUND_MESSAGE_DEDUP_TTL_MS = 10 * 60_000;
 const MAX_RECENT_INBOUND_MESSAGE_IDS = 5_000;
-const NON_USER_MESSAGE_TYPES = new Set([
-  "messageContextInfo",
-  "protocolMessage",
-  "senderKeyDistributionMessage",
-  "reactionMessage",
-  "pollUpdateMessage",
-  "keepInChatMessage",
-  "eventNotificationMessage",
-  "call",
-]);
 let socket;
+let connecting = false;
 let reconnectTimer;
+let reconnectAttempt = 0;
+let connectedAt;
+let shuttingDown = false;
 let catalogSyncPromise = null;
 
 function safeErrorDetails(error) {
@@ -104,6 +116,22 @@ function safeErrorDetails(error) {
   };
 }
 
+/**
+ * Les écouteurs Baileys sont synchrones : une promesse rejetée et non capturée
+ * ferait planter le processus et couperait la passerelle, donc plus aucune
+ * réponse WhatsApp. Toute tâche détachée passe par ce garde-fou.
+ */
+function runInBackground(label, task, context = {}) {
+  Promise.resolve()
+    .then(task)
+    .catch((error) =>
+      logger.error(
+        { err: safeErrorDetails(error), ...context },
+        `Tâche d’arrière-plan interrompue : ${label}.`,
+      ),
+    );
+}
+
 if (!WEBHOOK_URL || !GATEWAY_API_SECRET || !BUSINESS_JID) {
   throw new Error(
     "Définissez VERCEL_WEBHOOK_URL, GATEWAY_API_SECRET et BUSINESS_JID dans gateway-uppcoder/.env.",
@@ -117,40 +145,6 @@ function timestampDate(value) {
       ? value.toNumber()
       : Number(value || 0);
   return new Date((seconds || Date.now() / 1000) * 1000);
-}
-
-function messageContent(message) {
-  return normalizeMessageContent(message?.message) || message?.message || {};
-}
-
-function messageBody(message) {
-  const content = messageContent(message);
-  return (
-    content.conversation ||
-    content.extendedTextMessage?.text ||
-    content.imageMessage?.caption ||
-    content.videoMessage?.caption ||
-    content.documentMessage?.caption ||
-    content.productMessage?.product?.title ||
-    content.listResponseMessage?.singleSelectReply?.selectedRowId ||
-    content.buttonsResponseMessage?.selectedDisplayText ||
-    content.buttonsResponseMessage?.selectedButtonId ||
-    content.templateButtonReplyMessage?.selectedDisplayText ||
-    content.templateButtonReplyMessage?.selectedId ||
-    content.interactiveResponseMessage?.body?.text ||
-    content.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson ||
-    ""
-  );
-}
-
-function isNonUserMessageWithoutText(message) {
-  const contentTypes = Object.keys(messageContent(message)).filter(
-    (type) => type !== "messageContextInfo",
-  );
-  return (
-    contentTypes.length === 0 ||
-    contentTypes.every((type) => NON_USER_MESSAGE_TYPES.has(type))
-  );
 }
 
 function claimInboundMessageId(message) {
@@ -337,7 +331,7 @@ async function saveInbound(message, jid) {
   } catch (error) {
     // Une panne Supabase ne doit pas empêcher le traitement ni la réponse WhatsApp.
     logger.error(
-      { err: error, jid, messageId: message.key?.id },
+      { err: safeErrorDetails(error), jid, messageId: message.key?.id },
       "Message reçu non enregistré dans Supabase; le traitement continue.",
     );
   }
@@ -351,7 +345,7 @@ async function saveInbound(message, jid) {
       });
     } catch (error) {
       logger.error(
-        { err: error, jid },
+        { err: safeErrorDetails(error), jid },
         "Contact non actualisé dans Supabase; le traitement continue.",
       );
     }
@@ -363,10 +357,8 @@ async function saveHistory(messages) {
   const records = [];
   const latestByContact = new Map();
   for (const message of messages || []) {
-    const jid = normalizeJid(
-      message.key?.remoteJid || message.key?.remoteJidAlt,
-    );
-    if (!message.key?.id || !isDirectChat(jid)) continue;
+    const jid = canonicalContactJid(message);
+    if (!message.key?.id || !isDirectChat(jid) || jid === BUSINESS_JID) continue;
     const timestamp = timestampDate(message.messageTimestamp);
     records.push({
       jid,
@@ -393,7 +385,11 @@ async function saveHistory(messages) {
       await saveMessages(records.slice(offset, offset + 100));
     } catch (error) {
       logger.error(
-        { err: error, offset, batchSize: Math.min(100, records.length - offset) },
+        {
+          err: safeErrorDetails(error),
+          offset,
+          batchSize: Math.min(100, records.length - offset),
+        },
         "Lot d’historique non enregistré dans Supabase; la synchronisation continue.",
       );
     }
@@ -404,7 +400,7 @@ async function saveHistory(messages) {
         await updateContact(contact);
       } catch (error) {
         logger.error(
-          { err: error, jid: contact.jid },
+          { err: safeErrorDetails(error), jid: contact.jid },
           "Contact historique non actualisé dans Supabase.",
         );
       }
@@ -414,21 +410,6 @@ async function saveHistory(messages) {
     { stored: records.length, contacts: latestByContact.size },
     "Synchronisation de l’historique terminée.",
   );
-}
-
-function queueForChat(jid, job) {
-  const previous = chatQueues.get(jid) || Promise.resolve();
-  const current = previous
-    .catch(() => undefined)
-    .then(job)
-    .catch((error) => {
-      logger.error({ err: error, jid }, "Échec du traitement du message.");
-    })
-    .finally(() => {
-      if (chatQueues.get(jid) === current) chatQueues.delete(jid);
-    });
-  chatQueues.set(jid, current);
-  return current;
 }
 
 async function saveOutbound(jid, result, text, messageType) {
@@ -445,7 +426,7 @@ async function saveOutbound(jid, result, text, messageType) {
     });
   } catch (error) {
     logger.error(
-      { err: error, jid },
+      { err: safeErrorDetails(error), jid },
       "Réponse envoyée mais impossible à sauvegarder dans Supabase.",
     );
   }
@@ -460,20 +441,26 @@ async function sendCatalogUnavailableNotice(jid) {
     return true;
   } catch (error) {
     logger.error(
-      { err: error, jid },
+      { err: safeErrorDetails(error), jid },
       "Impossible d’envoyer le message de secours du catalogue.",
     );
     return false;
   }
 }
 
-async function sendAction(jid, action, products) {
+/**
+ * Envoie l’action décidée par le cerveau. `strict` fait échouer un envoi
+ * manuel sur un id inconnu au lieu d’envoyer un message de repli.
+ */
+async function sendAction(jid, action, products, { strict = false } = {}) {
   const message = String(action?.message || "").slice(0, 3000);
+
   if (action?.type === "product_card") {
     const product = products.find(
       (item) => item.id === String(action.product_id || ""),
     );
     if (!product) {
+      if (strict) throw new Error("Produit absent du catalogue courant.");
       const text =
         "Je ne retrouve pas ce produit dans le catalogue actuel. Souhaitez-vous que je vous envoie le catalogue complet ?";
       const sent = await socket.sendMessage(jid, { text });
@@ -500,27 +487,40 @@ async function sendAction(jid, action, products) {
     const selectedIds = Array.isArray(action.products)
       ? action.products.map(String)
       : [];
-    const chosen = selectedIds
+    const chosen = [...new Set(selectedIds)]
       .map((id) => products.find((item) => item.id === id))
-      .filter(Boolean);
+      .filter(Boolean)
+      .slice(0, 10);
     if (!chosen.length) {
+      if (strict) throw new Error("Aucun produit correspondant dans le catalogue courant.");
       const text =
         "Je n’ai pas trouvé de produit correspondant dans le catalogue actuel. Vous pouvez consulter le catalogue complet.";
       const sent = await socket.sendMessage(jid, { text });
       await saveOutbound(jid, sent, text, "conversation");
       return;
     }
-    const result = await sendProductList(
-      socket,
-      jid,
-      chosen,
-      message || "Voici les produits correspondants.",
-    );
+    const label = message || "Voici les produits correspondants.";
+    let result;
+    let messageType = "listMessage";
+    try {
+      result = await sendProductList(socket, jid, chosen, label);
+    } catch (error) {
+      // Les listes interactives peuvent être refusées ou ignorées par WhatsApp :
+      // on garantit un envoi texte équivalent plutôt qu’un silence.
+      logger.warn(
+        { err: safeErrorDetails(error), jid },
+        "Liste interactive refusée; repli en message texte.",
+      );
+      result = await socket.sendMessage(jid, {
+        text: buildProductText(chosen, label, BUSINESS_JID),
+      });
+      messageType = "conversation";
+    }
     await saveOutbound(
       jid,
       result,
-      message || "Liste de produits",
-      chosen.length ? "listMessage" : "conversation",
+      `${label} — ${chosen.map((item) => item.title).join(", ")}`,
+      messageType,
     );
     return;
   }
@@ -536,7 +536,9 @@ async function sendAction(jid, action, products) {
     await saveOutbound(
       jid,
       result,
-      `${message || "Voici notre catalogue complet."} https://wa.me/c/${BUSINESS_JID.split("@")[0]}`,
+      `${message || "Voici notre catalogue complet."} ${
+        businessLink(null, BUSINESS_JID) || ""
+      }`.trim(),
       "conversation",
     );
     return;
@@ -546,6 +548,118 @@ async function sendAction(jid, action, products) {
     message || "Merci pour votre message. Comment puis-je vous aider ?";
   const sent = await socket.sendMessage(jid, { text });
   await saveOutbound(jid, sent, text, "conversation");
+}
+
+async function handleOptOut(jid) {
+  try {
+    await setFollowupOptIn(jid, false);
+    logger.info({ jid }, "Contact désinscrit des relances.");
+  } catch (error) {
+    logger.error(
+      { err: safeErrorDetails(error), jid },
+      "Désinscription du contact non enregistrée.",
+    );
+  }
+  const text =
+    "C’est noté : vous ne recevrez plus nos messages de relance. Vous pouvez nous écrire à tout moment.";
+  const sent = await socket.sendMessage(jid, { text });
+  await saveOutbound(jid, sent, text, "conversation");
+}
+
+async function requestBrainReply(jid, job) {
+  const products = await refreshCatalog();
+  const publicProducts = products.map(
+    ({ id, title, description, price, currency }) => ({
+      id,
+      title,
+      description,
+      price,
+      currency,
+    }),
+  );
+
+  try {
+    const response = await axios.post(
+      WEBHOOK_URL,
+      {
+        jid,
+        messageId: job.messageId,
+        message: job.content,
+        catalogProducts: publicProducts,
+      },
+      {
+        timeout: WEBHOOK_TIMEOUT_MS,
+        headers: {
+          Authorization: `Bearer ${GATEWAY_API_SECRET}`,
+          ...(VERCEL_AUTOMATION_BYPASS_SECRET
+            ? { "x-vercel-protection-bypass": VERCEL_AUTOMATION_BYPASS_SECRET }
+            : {}),
+        },
+      },
+    );
+    await sendAction(jid, response.data, products);
+  } catch (error) {
+    logger.error(
+      {
+        err: safeErrorDetails(error),
+        jid,
+        messageId: job.messageId,
+      },
+      "Webhook Vercel indisponible.",
+    );
+    const text =
+      "Je rencontre un problème technique pour le moment. Votre message a bien été reçu ; nous reviendrons vers vous dès que possible.";
+    const sent = await socket.sendMessage(jid, { text });
+    await saveOutbound(jid, sent, text, "conversation");
+  }
+}
+
+/**
+ * Une seule requête au cerveau par conversation à la fois. Si plusieurs
+ * messages arrivent pendant le traitement, le plus récent remplace les autres :
+ * l’historique complet est déjà enregistré, donc le cerveau voit tous les
+ * messages sans payer un appel par message.
+ */
+function enqueueReply(jid, job) {
+  let state = replyQueues.get(jid);
+  if (!state) {
+    state = { running: false, pending: null };
+    replyQueues.set(jid, state);
+  }
+
+  if (state.running) {
+    state.pending = job;
+    logger.debug({ jid }, "Message suivant mis en attente sur cette conversation.");
+    return;
+  }
+
+  runInBackground("file de réponse", () => drainReplies(jid, state, job), {
+    jid,
+  });
+}
+
+async function drainReplies(jid, state, firstJob) {
+  state.running = true;
+  let job = firstJob;
+  try {
+    while (job) {
+      try {
+        await requestBrainReply(jid, job);
+      } catch (error) {
+        logger.error(
+          { err: safeErrorDetails(error), jid },
+          "Échec du traitement du message.",
+        );
+      }
+      job = state.pending;
+      state.pending = null;
+    }
+  } finally {
+    // Sans ce finally, une erreur inattendue laisserait la conversation
+    // marquée « en cours » et les messages suivants seraient ignorés.
+    state.running = false;
+    replyQueues.delete(jid);
+  }
 }
 
 async function processLiveMessage(message, jid) {
@@ -577,11 +691,16 @@ async function processLiveMessage(message, jid) {
   } catch (error) {
     // Même une erreur inattendue pendant la sauvegarde ne doit pas bloquer Vercel.
     logger.error(
-      { err: error, jid, messageId: message.key?.id },
+      { err: safeErrorDetails(error), jid, messageId: message.key?.id },
       "Échec de sauvegarde du message entrant; le traitement continue vers Vercel.",
     );
   }
   if (!inserted) return;
+
+  if (isOptOutMessage(body)) {
+    await handleOptOut(jid);
+    return;
+  }
 
   const selectedProductId = getSelectedProductId(message);
   if (selectedProductId) {
@@ -607,6 +726,11 @@ async function processLiveMessage(message, jid) {
       await sendCatalogUnavailableNotice(jid);
       return;
     }
+    const text =
+      "Ce produit n’est plus disponible dans notre catalogue. Souhaitez-vous que je vous montre les produits actuels ?";
+    const sent = await socket.sendMessage(jid, { text });
+    await saveOutbound(jid, sent, text, "conversation");
+    return;
   }
 
   if (!body) {
@@ -617,52 +741,7 @@ async function processLiveMessage(message, jid) {
     return;
   }
 
-  const products = await refreshCatalog();
-  const publicProducts = products.map(
-    ({ id, title, description, price, currency, retailerId }) => ({
-      id,
-      title,
-      description,
-      price,
-      currency,
-      retailerId,
-    }),
-  );
-
-  try {
-    const response = await axios.post(
-      WEBHOOK_URL,
-      {
-        jid,
-        messageId: message.key.id,
-        message: body,
-        pushName: message.pushName || null,
-        catalogProducts: publicProducts,
-      },
-      {
-        timeout: 55_000,
-        headers: {
-          Authorization: `Bearer ${GATEWAY_API_SECRET}`,
-          ...(VERCEL_AUTOMATION_BYPASS_SECRET
-            ? { "x-vercel-protection-bypass": VERCEL_AUTOMATION_BYPASS_SECRET }
-            : {}),
-        },
-      },
-    );
-    await sendAction(jid, response.data, products);
-  } catch (error) {
-    logger.error(
-      {
-        err: safeErrorDetails(error),
-        jid,
-      },
-      "Webhook Vercel indisponible.",
-    );
-    const text =
-      "Je rencontre un problème technique pour le moment. Votre message a bien été reçu ; nous reviendrons vers vous dès que possible.";
-    const sent = await socket.sendMessage(jid, { text });
-    await saveOutbound(jid, sent, text, "conversation");
-  }
+  enqueueReply(jid, { messageId: message.key.id, content: body });
 }
 
 async function dispatchManualMessage(body) {
@@ -672,68 +751,23 @@ async function dispatchManualMessage(body) {
   if (!isDirectChat(jid))
     throw new Error("Seuls les JID de conversation privée sont acceptés.");
 
-  if (body.type === "product_card") {
+  const type = String(body.type || "text");
+  if (["product_card", "product_list", "catalog_link"].includes(type)) {
     const products = await refreshCatalog();
     if (!products.length && catalogCache.refreshFailed) {
       await sendCatalogUnavailableNotice(jid);
       return;
     }
-    const product = products.find(
-      (item) => item.id === String(body.product_id || ""),
-    );
-    if (!product) throw new Error("Produit absent du catalogue courant.");
-    const result = await sendProductCard(
-      socket,
+    await sendAction(
       jid,
-      product,
-      BUSINESS_JID,
-      body.message || "",
-    );
-    await saveOutbound(
-      jid,
-      result,
-      `Fiche produit : ${product.title}`,
-      "productMessage",
-    );
-    return;
-  }
-  if (body.type === "product_list") {
-    const products = await refreshCatalog();
-    if (!products.length && catalogCache.refreshFailed) {
-      await sendCatalogUnavailableNotice(jid);
-      return;
-    }
-    const chosen = (body.products || [])
-      .map(String)
-      .map((id) => products.find((item) => item.id === id))
-      .filter(Boolean);
-    const result = await sendProductList(
-      socket,
-      jid,
-      chosen,
-      body.message || "Voici les produits correspondants.",
-    );
-    await saveOutbound(
-      jid,
-      result,
-      body.message || "Liste de produits",
-      "listMessage",
-    );
-    return;
-  }
-  if (body.type === "catalog_link") {
-    const result = await sendCatalogLink(
-      socket,
-      jid,
-      BUSINESS_JID,
-      null,
-      body.message || "Voici notre catalogue complet.",
-    );
-    await saveOutbound(
-      jid,
-      result,
-      body.message || "Lien du catalogue",
-      "conversation",
+      {
+        type,
+        message: body.message,
+        product_id: body.product_id,
+        products: body.products,
+      },
+      products,
+      { strict: true },
     );
     return;
   }
@@ -771,9 +805,22 @@ function readJson(req) {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, { "content-type": "application/json" });
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     res.end(
-      JSON.stringify({ ok: true, whatsappConnected: Boolean(socket?.user) }),
+      JSON.stringify({
+        ok: true,
+        whatsappConnected: Boolean(socket?.user),
+        connectedAt: connectedAt ? connectedAt.toISOString() : null,
+        reconnectAttempt,
+        uptimeSeconds: Math.round(process.uptime()),
+        catalog: {
+          products: catalogCache.products.length,
+          refreshedAt: catalogCache.refreshedAt
+            ? new Date(catalogCache.refreshedAt).toISOString()
+            : null,
+          failed: catalogCache.refreshFailed,
+        },
+      }),
     );
     return;
   }
@@ -792,142 +839,204 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
   } catch (error) {
-    logger.warn({ err: error }, "Requête d’envoi gateway refusée ou échouée.");
+    logger.warn({ err: safeErrorDetails(error) }, "Requête d’envoi gateway refusée ou échouée.");
     res.writeHead(400, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: false, error: error.message }));
   }
 });
 
-server.listen(PORT, "0.0.0.0", () =>
-  logger.info({ port: PORT }, "API Gateway prête."),
-);
-
-async function connectToWhatsApp() {
-  const { state, saveCreds } = await useSupabaseAuthState();
-  let pairingCodeRequested = false;
-  socket = makeWASocket({
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(
-        state.keys,
-        logger.child({ component: "auth-storage" }),
-      ),
-    },
-    browser: Browsers.ubuntu("Chrome"), // <--- LA CORRECTION EST ICI
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    logger: logger.child({ component: "baileys" }),
-  });
-
-  socket.ev.on("creds.update", () => {
-    void saveCreds().catch((error) =>
-      logger.error({ err: error }, "Échec d’enregistrement de la session Baileys dans Supabase Storage."),
-    );
-  });
-  socket.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr && !state.creds.registered && !pairingCodeRequested) {
-      pairingCodeRequested = true;
-      const phoneNumber = BUSINESS_JID.split("@")[0].replace(/\D/g, "");
-      if (!/^\d{8,15}$/.test(phoneNumber)) {
-        logger.error(
-          "BUSINESS_JID doit contenir un numéro international valide pour le code d’appairage.",
-        );
-      } else {
-        logger.info(
-          "Demande d’un code d’appairage WhatsApp. Sur le téléphone, choisissez Appareils connectés puis Lier avec un numéro de téléphone.",
-        );
-        void socket
-          .requestPairingCode(phoneNumber)
-          .then((code) => {
-            logger.info({ pairingCode: code }, "CODE D’APPAIRAGE WHATSAPP");
-          })
-          .catch((error) => {
-            logger.error(
-              { err: error },
-              "Erreur lors de la génération du code d’appairage.",
-            );
-          });
-      }
-    }
-    if (connection === "open") {
-      logger.info({ jid: socket.user?.id }, "WhatsApp Business connecté.");
-      void syncCatalog("connexion");
-    }
-    if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const numericStatusCode = Number(statusCode);
-      const shouldReconnect =
-        numericStatusCode !== DisconnectReason.loggedOut &&
-        numericStatusCode !== 440;
-      logger.warn(
-        { statusCode, shouldReconnect },
-        "Connexion WhatsApp fermée.",
-      );
-      if (shouldReconnect) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(() => void connectToWhatsApp(), 5_000);
-      } else if (numericStatusCode === 440) {
-        socket = undefined;
-        logger.fatal(
-          "Conflit de session (440). Reconnexion automatique désactivée; résolvez le conflit puis redémarrez le service.",
-        );
-      } else {
-        logger.fatal("WhatsApp a déconnecté la session. Effacement de l’authentification enregistrée.");
-        void clearSupabaseAuthState()
-          .catch((error) =>
-            logger.error(
-              { err: error },
-              "Impossible d’effacer la session Supabase après déconnexion.",
-            ),
-          )
-          .finally(() => process.exit(1));
-      }
-    }
-  });
-
-  socket.ev.on("messaging-history.set", ({ messages }) => {
-    void saveHistory(messages).catch((error) =>
-      logger.error(
-        { err: error },
-        "Échec d’enregistrement de l’historique synchronisé.",
-      ),
-    );
-  });
-
-  socket.ev.on("messages.upsert", ({ messages, type }) => {
-    for (const message of messages || []) {
-      const jid = normalizeJid(
-        message.key?.remoteJid || message.key?.remoteJidAlt,
-      );
-      if (!isDirectChat(jid) || jid === BUSINESS_JID) continue;
-      if (type === "notify" && !message.key?.fromMe) {
-        void queueForChat(jid, () => processLiveMessage(message, jid));
-      } else {
-        void saveInbound(message, jid).catch((error) =>
-          logger.error(
-            { err: error, jid },
-            "Échec d’enregistrement d’un message upsert.",
-          ),
-        );
-      }
-    }
-  });
-}
-
-void connectToWhatsApp().catch((error) => {
-  logger.fatal({ err: error }, "Impossible de démarrer Baileys.");
+server.on("error", (error) => {
+  logger.fatal({ err: safeErrorDetails(error) }, "Serveur HTTP en erreur.");
   process.exit(1);
 });
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, async () => {
-    clearTimeout(reconnectTimer);
-    server.close();
-    try {
-      await socket?.end();
-    } catch {
-      /* fermeture best-effort */
-    }
-    process.exit(0);
-  });
+function scheduleReconnect() {
+  if (shuttingDown) return;
+
+  reconnectAttempt += 1;
+  const base = Math.min(
+    RECONNECT_BASE_MS * 2 ** (reconnectAttempt - 1),
+    RECONNECT_MAX_MS,
+  );
+  const delay = Math.round(base * (0.7 + Math.random() * 0.6));
+
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(
+    () => runInBackground("reconnexion WhatsApp", connectToWhatsApp),
+    delay,
+  );
+  logger.warn(
+    { attempt: reconnectAttempt, delayMs: delay },
+    "Reconnexion WhatsApp planifiée.",
+  );
 }
+
+async function connectToWhatsApp() {
+  if (shuttingDown || connecting) return;
+  connecting = true;
+
+  try {
+    const { state, saveCreds } = await useSupabaseAuthState();
+    let pairingCodeRequested = false;
+    socket = makeWASocket({
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(
+          state.keys,
+          logger.child({ component: "auth-storage" }),
+        ),
+      },
+      browser: Browsers.ubuntu("Chrome"),
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      logger: logger.child({ component: "baileys" }),
+    });
+
+    socket.ev.on("creds.update", () => {
+      void saveCreds().catch((error) =>
+        logger.error(
+          { err: safeErrorDetails(error) },
+          "Échec d’enregistrement de la session Baileys dans Supabase Storage.",
+        ),
+      );
+    });
+
+    socket.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
+      if (qr && !state.creds.registered && !pairingCodeRequested) {
+        pairingCodeRequested = true;
+        const phoneNumber = BUSINESS_JID.split("@")[0].replace(/\D/g, "");
+        if (!/^\d{8,15}$/.test(phoneNumber)) {
+          logger.error(
+            "BUSINESS_JID doit contenir un numéro international valide pour le code d’appairage.",
+          );
+        } else {
+          logger.info(
+            "Demande d’un code d’appairage WhatsApp. Sur le téléphone, choisissez Appareils connectés puis Lier avec un numéro de téléphone.",
+          );
+          void socket
+            .requestPairingCode(phoneNumber)
+            .then((code) => {
+              logger.info({ pairingCode: code }, "CODE D’APPAIRAGE WHATSAPP");
+            })
+            .catch((error) => {
+              logger.error(
+                { err: safeErrorDetails(error) },
+                "Erreur lors de la génération du code d’appairage.",
+              );
+            });
+        }
+      }
+      if (connection === "open") {
+        connectedAt = new Date();
+        reconnectAttempt = 0;
+        logger.info({ jid: socket.user?.id }, "WhatsApp Business connecté.");
+        runInBackground("synchronisation du catalogue", () =>
+          syncCatalog("connexion"),
+        );
+      }
+      if (connection === "close") {
+        connectedAt = undefined;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const numericStatusCode = Number(statusCode);
+        const shouldReconnect =
+          numericStatusCode !== DisconnectReason.loggedOut &&
+          numericStatusCode !== 440;
+        logger.warn(
+          { statusCode, shouldReconnect },
+          "Connexion WhatsApp fermée.",
+        );
+        if (shouldReconnect) {
+          scheduleReconnect();
+        } else if (numericStatusCode === 440) {
+          socket = undefined;
+          logger.fatal(
+            "Conflit de session (440). Reconnexion automatique désactivée; résolvez le conflit puis redémarrez le service.",
+          );
+        } else {
+          logger.fatal("WhatsApp a déconnecté la session. Effacement de l’authentification enregistrée.");
+          void clearSupabaseAuthState()
+            .catch((error) =>
+              logger.error(
+                { err: safeErrorDetails(error) },
+                "Impossible d’effacer la session Supabase après déconnexion.",
+              ),
+            )
+            .finally(() => process.exit(1));
+        }
+      }
+    });
+
+    socket.ev.on("messaging-history.set", ({ messages }) => {
+      void saveHistory(messages).catch((error) =>
+        logger.error(
+          { err: safeErrorDetails(error) },
+          "Échec d’enregistrement de l’historique synchronisé.",
+        ),
+      );
+    });
+
+    socket.ev.on("messages.upsert", ({ messages, type }) => {
+      for (const message of messages || []) {
+        const jid = canonicalContactJid(message);
+        if (!isDirectChat(jid) || jid === BUSINESS_JID) continue;
+        if (type === "notify" && !message.key?.fromMe) {
+          runInBackground(
+            "traitement du message reçu",
+            () => processLiveMessage(message, jid),
+            { jid, messageId: message.key?.id },
+          );
+        } else {
+          void saveInbound(message, jid).catch((error) =>
+            logger.error(
+              { err: safeErrorDetails(error), jid },
+              "Échec d’enregistrement d’un message upsert.",
+            ),
+          );
+        }
+      }
+    });
+  } finally {
+    connecting = false;
+  }
+}
+
+async function shutdown(exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  clearTimeout(reconnectTimer);
+  server.close();
+
+  try {
+    await flushAuthState();
+  } catch (error) {
+    logger.error(
+      { err: safeErrorDetails(error) },
+      "Session Baileys non enregistrée avant l’arrêt.",
+    );
+  }
+  try {
+    await socket?.end();
+  } catch {
+    /* fermeture best-effort */
+  }
+  process.exit(exitCode);
+}
+
+async function main() {
+  server.listen(PORT, "0.0.0.0", () =>
+    logger.info({ port: PORT }, "API Gateway prête."),
+  );
+  await connectToWhatsApp();
+}
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () =>
+    runInBackground("arrêt de la passerelle", () => shutdown(0)),
+  );
+}
+
+void main().catch((error) => {
+  logger.fatal({ err: safeErrorDetails(error) }, "Impossible de démarrer la passerelle.");
+  process.exit(1);
+});

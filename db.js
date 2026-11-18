@@ -4,11 +4,6 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-console.log(
-  '[Supabase] Préfixe de SUPABASE_SERVICE_ROLE_KEY (10 premiers caractères):',
-  supabaseKey ? supabaseKey.slice(0, 10) : 'absente',
-);
-
 if (!supabaseUrl || !supabaseKey) {
   throw new Error('Définissez SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY dans l’environnement du gateway.');
 }
@@ -56,19 +51,6 @@ export async function saveMessage(message) {
   return { inserted: result.inserted > 0 };
 }
 
-export async function getChatHistory(jid, limit = 10) {
-  const safeLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
-  const { data, error } = await supabase
-    .from('messages')
-    .select('jid,wa_message_id,from_me,body,message_type,created_at')
-    .eq('jid', jid)
-    .order('created_at', { ascending: false })
-    .limit(safeLimit);
-
-  if (error) throw error;
-  return (data || []).reverse();
-}
-
 export async function updateContact({ jid, pushName, lastInteraction }) {
   const { error } = await supabase.rpc('upsert_contact_from_gateway', {
     p_jid: jid,
@@ -78,22 +60,14 @@ export async function updateContact({ jid, pushName, lastInteraction }) {
   if (error) throw error;
 }
 
-export async function getContactByJid(jid) {
-  const { data, error } = await supabase
-    .from('contacts')
-    .select('jid,push_name,last_interaction,followup_opt_in,last_followup_at,followup_message')
-    .eq('jid', jid)
-    .maybeSingle();
-
-  if (error) throw error;
-  return data;
-}
-
-export async function markFollowupSent(jid, sentAt = new Date()) {
-  const { error } = await supabase
-    .from('contacts')
-    .update({ last_followup_at: asIsoDate(sentAt) })
-    .eq('jid', jid);
-
+/**
+ * Désinscription aux relances. La fonction SQL marque followup_opt_in = false,
+ * ce qui sort immédiatement le contact du cron /api/relance.
+ */
+export async function setFollowupOptIn(jid, optIn) {
+  const { error } = await supabase.rpc('set_followup_opt_in', {
+    p_jid: jid,
+    p_opt_in: Boolean(optIn),
+  });
   if (error) throw error;
 }
