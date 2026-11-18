@@ -245,6 +245,13 @@ async function refreshCatalog({ force = false } = {}) {
         catalogCache.refreshedAt = Date.now();
         catalogCache.retryAfter = 0;
         catalogCache.refreshFailed = false;
+        logger.info(
+          {
+            products: products.length,
+            productsWithImages: products.filter((product) => product.imageUrl).length,
+          },
+          "Catalogue Supabase chargé.",
+        );
         return products;
       });
     let backgroundTimeout;
@@ -555,7 +562,57 @@ async function sendAction(jid, action, products, { strict = false } = {}) {
     return;
   }
 
+  if (action?.type === "product_gallery") {
+    const selectedIds = Array.isArray(action.products)
+      ? action.products.map(String)
+      : [];
+    const chosen = [...new Set(selectedIds)]
+      .map((id) => products.find((item) => item.id === id))
+      .filter((item) => item?.imageUrl)
+      .slice(0, 5);
+
+    if (!chosen.length) {
+      const text = `${message || "Je n’ai pas de photos de produits à afficher ici."} ${businessLink(null, BUSINESS_JID) || ""}`.trim();
+      const sent = await socket.sendMessage(jid, { text });
+      await saveOutbound(jid, sent, text, "conversation");
+      return;
+    }
+
+    let sentCount = 0;
+    for (const [index, product] of chosen.entries()) {
+      try {
+        const result = await sendProductCard(
+          socket,
+          jid,
+          product,
+          BUSINESS_JID,
+          index === 0 ? message || "Voici quelques produits avec leurs photos." : "",
+        );
+        await saveOutbound(
+          jid,
+          result,
+          `Fiche produit : ${product.title}`,
+          "productMessage",
+        );
+        sentCount += 1;
+      } catch (error) {
+        logger.warn(
+          { err: safeErrorDetails(error), jid, productId: product.id },
+          "Impossible d’envoyer une fiche produit de la galerie.",
+        );
+      }
+    }
+
+    if (!sentCount) {
+      const text = `Je n’ai pas réussi à afficher les photos. Voici le catalogue complet : ${businessLink(null, BUSINESS_JID) || ""}`.trim();
+      const sent = await socket.sendMessage(jid, { text });
+      await saveOutbound(jid, sent, text, "conversation");
+    }
+    return;
+  }
+
   if (action?.type === "catalog_link") {
+    const catalogUrl = businessLink(null, BUSINESS_JID) || "";
     const result = await sendCatalogLink(
       socket,
       jid,
@@ -566,9 +623,9 @@ async function sendAction(jid, action, products, { strict = false } = {}) {
     await saveOutbound(
       jid,
       result,
-      `${message || "Voici notre catalogue complet."} ${
-        businessLink(null, BUSINESS_JID) || ""
-      }`.trim(),
+      [message.replaceAll(catalogUrl, "").trim(), catalogUrl]
+        .filter(Boolean)
+        .join("\n"),
       "conversation",
     );
     return;
@@ -602,12 +659,13 @@ async function handleOptOut(jid) {
 async function requestBrainReply(jid, job) {
   const products = await refreshCatalog();
   const publicProducts = products.map(
-    ({ id, title, description, price, currency }) => ({
+    ({ id, title, description, price, currency, imageUrl }) => ({
       id,
       title,
       description,
       price,
       currency,
+      hasImage: Boolean(imageUrl),
     }),
   );
 
@@ -805,7 +863,7 @@ async function dispatchManualMessage(body) {
     throw new Error("Seuls les JID de conversation privée sont acceptés.");
 
   const type = String(body.type || "text");
-  if (["product_card", "product_list", "catalog_link"].includes(type)) {
+  if (["product_card", "product_list", "product_gallery", "catalog_link"].includes(type)) {
     const products = await refreshCatalog();
     if (!products.length && catalogCache.refreshFailed) {
       await sendCatalogUnavailableNotice(jid);
@@ -871,6 +929,7 @@ const server = http.createServer(async (req, res) => {
         uptimeSeconds: Math.round(process.uptime()),
         catalog: {
           products: catalogCache.products.length,
+          productsWithImages: catalogCache.products.filter((product) => product.imageUrl).length,
           refreshedAt: catalogCache.refreshedAt
             ? new Date(catalogCache.refreshedAt).toISOString()
             : null,

@@ -173,7 +173,7 @@ export async function syncCatalogFromWhatsApp(
   const rows = [...unique.values()].map(toProductRow);
 
   if (!rows.length) {
-    return { synced: 0, deactivated: 0, complete };
+    return { synced: 0, productsWithImages: 0, deactivated: 0, complete };
   }
 
   const { error: upsertError } = await supabase
@@ -208,7 +208,12 @@ export async function syncCatalogFromWhatsApp(
     }
   }
 
-  return { synced: rows.length, deactivated, complete };
+  return {
+    synced: rows.length,
+    productsWithImages: rows.filter((row) => row.image_url).length,
+    deactivated,
+    complete,
+  };
 }
 
 export async function sendProductCard(sock, jid, product, businessJid = BUSINESS_JID, message = '') {
@@ -273,7 +278,8 @@ export async function sendCatalogLink(sock, jid, businessJid = BUSINESS_JID, pro
   const link = productId
     ? `https://wa.me/p/${encodeURIComponent(productId)}/${digits}`
     : `https://wa.me/c/${digits}`;
-  const text = [message, link].filter(Boolean).join('\n');
+  const cleanMessage = String(message || '').replaceAll(link, '').trim();
+  const text = [cleanMessage, link].filter(Boolean).join('\n');
   return sock.sendMessage(jid, { text });
 }
 
