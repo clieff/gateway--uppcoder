@@ -97,10 +97,12 @@ let shuttingDown = false;
 let catalogSyncPromise = null;
 let whatsappPhase = "booting";
 let whatsappPhaseUpdatedAt = Date.now();
+let whatsappProgress = { phase: whatsappPhase };
 
-function setWhatsAppPhase(phase) {
+function setWhatsAppPhase(phase, details = {}) {
   whatsappPhase = phase;
   whatsappPhaseUpdatedAt = Date.now();
+  whatsappProgress = { phase, ...details };
 }
 
 function safeErrorDetails(error) {
@@ -843,6 +845,7 @@ const server = http.createServer(async (req, res) => {
         whatsappConnected: Boolean(socket?.user),
         whatsappPhase,
         whatsappPhaseUpdatedAt: new Date(whatsappPhaseUpdatedAt).toISOString(),
+        startupProgress: whatsappProgress,
         connectedAt: connectedAt ? connectedAt.toISOString() : null,
         reconnectAttempt,
         uptimeSeconds: Math.round(process.uptime()),
@@ -917,10 +920,10 @@ async function connectToWhatsApp() {
     );
     const authStartedAt = Date.now();
     const { state, saveCreds } = await useSupabaseAuthState({
-      onProgress: ({ phase, completed, total, restored }) => {
-        setWhatsAppPhase(phase);
+      onProgress: ({ phase, ...details }) => {
+        setWhatsAppPhase(phase, details);
         logger.info(
-          { phase, completed, total, restored },
+          { phase, ...details },
           "Progression du chargement de la session WhatsApp.",
         );
       },

@@ -122,24 +122,37 @@ async function downloadJson(path) {
   }
 }
 
-async function listObjects(prefix) {
+async function listObjects(prefix, onProgress) {
   const storage = supabase.storage.from(bucketName);
-  const pageSize = 100;
+  const pageSize = 1_000;
   const names = [];
-  let offset = 0;
+  let cursor;
+  let pageNumber = 0;
 
   while (true) {
-    const { data, error } = await storage.list(prefix, {
+    const { data, error } = await storage.listV2({
+      prefix: `${prefix}/`,
       limit: pageSize,
-      offset,
-      sortBy: { column: "name", order: "asc" },
+      cursor,
+      with_delimiter: false,
     });
     if (error) throw error;
 
-    const page = data || [];
-    names.push(...page.filter((item) => item.id || item.metadata).map((item) => item.name));
-    if (page.length < pageSize) break;
-    offset += page.length;
+    const objects = data?.objects || [];
+    names.push(...objects.map((item) => item.name));
+    pageNumber += 1;
+    onProgress?.({
+      phase: "listing_legacy_session_files",
+      page: pageNumber,
+      listed: names.length,
+      hasNext: Boolean(data?.hasNext),
+    });
+
+    if (!data?.hasNext) break;
+    if (!data.nextCursor) {
+      throw new Error("Supabase Storage indique une page suivante sans curseur.");
+    }
+    cursor = data.nextCursor;
   }
 
   return names;
@@ -200,7 +213,7 @@ function parseLegacyKeyName(objectName) {
  */
 async function migrateLegacyState(onProgress) {
   onProgress?.({ phase: "listing_legacy_session_files" });
-  const names = await listObjects(instancePrefix);
+  const names = await listObjects(instancePrefix, onProgress);
   const legacyNames = names.filter((name) => name !== "state.json");
   onProgress?.({ phase: "legacy_session_files_listed", total: legacyNames.length });
   if (!legacyNames.length) return null;
