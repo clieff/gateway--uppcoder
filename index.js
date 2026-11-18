@@ -75,6 +75,26 @@ const WEBHOOK_TIMEOUT_MS = 45_000;
 const RECONNECT_BASE_MS = 5_000;
 const RECONNECT_MAX_MS = 60_000;
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+// libsignal écrit des objets de session complets sur console, avec des clés privées.
+// On garde le message de diagnostic, mais on retire l’objet sensible des logs Render.
+const sensitiveSignalLogMessages = new Set([
+  "Closing session:",
+  "Opening session:",
+  "Removing old closed session:",
+  "Session already closed",
+]);
+for (const method of ["info", "warn"]) {
+  const original = console[method].bind(console);
+  console[method] = (...args) => {
+    if (sensitiveSignalLogMessages.has(args[0])) {
+      original(args[0], "[détails de session masqués]");
+      return;
+    }
+    original(...args);
+  };
+}
+
 const catalogCache = {
   products: [],
   refreshedAt: 0,

@@ -126,6 +126,7 @@ async function listObjects(prefix, onProgress) {
   const storage = supabase.storage.from(bucketName);
   const pageSize = 1_000;
   const names = [];
+  const prefixPath = `${prefix}/`;
   let cursor;
   let pageNumber = 0;
 
@@ -139,7 +140,18 @@ async function listObjects(prefix, onProgress) {
     if (error) throw error;
 
     const objects = data?.objects || [];
-    names.push(...objects.map((item) => item.name));
+    names.push(
+      ...objects.map((item) => {
+        const candidates = [item.name, item.key]
+          .filter((value) => typeof value === "string" && value)
+          .map((value) =>
+            value.startsWith(prefixPath)
+              ? value.slice(prefixPath.length)
+              : value.slice(value.lastIndexOf("/") + 1),
+          );
+        return candidates.find((name) => name.endsWith(".json")) || candidates[0] || "";
+      }),
+    );
     pageNumber += 1;
     onProgress?.({
       phase: "listing_legacy_session_files",
@@ -218,10 +230,17 @@ async function migrateLegacyState(onProgress) {
   onProgress?.({ phase: "legacy_session_files_listed", total: legacyNames.length });
   if (!legacyNames.length) return null;
 
+  const credentialsName = `${Buffer.from("creds.json", "utf8").toString("base64url")}.json`;
+  const legacyKeyNames = legacyNames.filter((name) => name !== credentialsName);
+  const parseableKeyNames = legacyKeyNames.filter((name) => parseLegacyKeyName(name));
+  if (legacyKeyNames.length && parseableKeyNames.length !== legacyKeyNames.length) {
+    throw new Error(
+      `Migration de session annulée : ${legacyKeyNames.length - parseableKeyNames.length} noms de clés historiques sont inconnus. Les anciens fichiers sont conservés.`,
+    );
+  }
+
   onProgress?.({ phase: "reading_legacy_credentials" });
-  const creds = await downloadJson(
-    `${instancePrefix}/${Buffer.from("creds.json", "utf8").toString("base64url")}.json`,
-  );
+  const creds = await downloadJson(`${instancePrefix}/${credentialsName}`);
   if (!creds) return null;
 
   const keys = new Map();
@@ -243,12 +262,20 @@ async function migrateLegacyState(onProgress) {
       restored += 1;
     }
     completed += batch.length;
-    onProgress?.({
-      phase: "reading_legacy_session_keys",
-      completed,
-      total: legacyNames.length,
-      restored,
-    });
+    if (completed % 200 === 0 || completed === legacyNames.length) {
+      onProgress?.({
+        phase: "reading_legacy_session_keys",
+        completed,
+        total: legacyNames.length,
+        restored,
+      });
+    }
+  }
+
+  if (restored !== parseableKeyNames.length) {
+    throw new Error(
+      `Migration de session annulée : ${restored}/${parseableKeyNames.length} clés historiques lues. Les anciens fichiers sont conservés.`,
+    );
   }
 
   const migrated = { creds, keys };
@@ -278,8 +305,20 @@ async function loadState(onProgress) {
   onProgress?.({ phase: "reading_current_session" });
   const stored = await downloadJson(statePath);
   if (stored) {
-    onProgress?.({ phase: "current_session_loaded" });
-    return hydrate(stored);
+    const hydrated = hydrate(stored);
+    if (hydrated.creds.registered && hydrated.keys.size === 0) {
+      onProgress?.({ phase: "current_session_missing_signal_keys" });
+      const migrated = await migrateLegacyState(onProgress);
+      if (!migrated?.keys.size) {
+        throw new Error(
+          "La session WhatsApp enregistrée ne contient aucune clé Signal et les anciennes clés n’ont pas pu être restaurées. Réappairage requis si les fichiers historiques sont absents.",
+        );
+      }
+      return migrated;
+    }
+
+    onProgress?.({ phase: "current_session_loaded", keyTypes: hydrated.keys.size });
+    return hydrated;
   }
 
   const migrated = await migrateLegacyState(onProgress);
