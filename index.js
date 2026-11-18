@@ -95,6 +95,13 @@ let reconnectAttempt = 0;
 let connectedAt;
 let shuttingDown = false;
 let catalogSyncPromise = null;
+let whatsappPhase = "booting";
+let whatsappPhaseUpdatedAt = Date.now();
+
+function setWhatsAppPhase(phase) {
+  whatsappPhase = phase;
+  whatsappPhaseUpdatedAt = Date.now();
+}
 
 function safeErrorDetails(error) {
   const responseData = error?.response?.data;
@@ -834,6 +841,8 @@ const server = http.createServer(async (req, res) => {
       JSON.stringify({
         ok: true,
         whatsappConnected: Boolean(socket?.user),
+        whatsappPhase,
+        whatsappPhaseUpdatedAt: new Date(whatsappPhaseUpdatedAt).toISOString(),
         connectedAt: connectedAt ? connectedAt.toISOString() : null,
         reconnectAttempt,
         uptimeSeconds: Math.round(process.uptime()),
@@ -884,6 +893,7 @@ function scheduleReconnect() {
   );
   const delay = Math.round(base * (0.7 + Math.random() * 0.6));
 
+  setWhatsAppPhase("reconnect_wait");
   clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(
     () => runInBackground("reconnexion WhatsApp", connectToWhatsApp),
@@ -900,7 +910,28 @@ async function connectToWhatsApp() {
   connecting = true;
 
   try {
-    const { state, saveCreds } = await useSupabaseAuthState();
+    setWhatsAppPhase("loading_session");
+    logger.info(
+      { attempt: reconnectAttempt + 1 },
+      "Chargement de la session WhatsApp depuis Supabase Storage.",
+    );
+    const authStartedAt = Date.now();
+    const { state, saveCreds } = await useSupabaseAuthState({
+      onProgress: ({ phase, completed, total, restored }) => {
+        setWhatsAppPhase(phase);
+        logger.info(
+          { phase, completed, total, restored },
+          "Progression du chargement de la session WhatsApp.",
+        );
+      },
+    });
+    logger.info(
+      { durationMs: Date.now() - authStartedAt },
+      "Session WhatsApp chargée.",
+    );
+
+    setWhatsAppPhase("creating_socket");
+    logger.info("Création du socket Baileys.");
     let pairingCodeRequested = false;
     socket = makeWASocket({
       auth: {
@@ -915,6 +946,8 @@ async function connectToWhatsApp() {
       markOnlineOnConnect: false,
       logger: logger.child({ component: "baileys" }),
     });
+    setWhatsAppPhase("waiting_for_whatsapp");
+    logger.info("Socket Baileys créé; attente de la connexion WhatsApp.");
 
     socket.ev.on("creds.update", () => {
       void saveCreds().catch((error) =>
@@ -926,8 +959,13 @@ async function connectToWhatsApp() {
     });
 
     socket.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
+      if (connection === "connecting") {
+        setWhatsAppPhase("connecting_to_whatsapp");
+        logger.info("Baileys tente la connexion à WhatsApp.");
+      }
       if (qr && !state.creds.registered && !pairingCodeRequested) {
         pairingCodeRequested = true;
+        setWhatsAppPhase("pairing_code_requested");
         const phoneNumber = BUSINESS_JID.split("@")[0].replace(/\D/g, "");
         if (!/^\d{8,15}$/.test(phoneNumber)) {
           logger.error(
@@ -953,6 +991,7 @@ async function connectToWhatsApp() {
       if (connection === "open") {
         connectedAt = new Date();
         reconnectAttempt = 0;
+        setWhatsAppPhase("connected");
         logger.info({ jid: socket.user?.id }, "WhatsApp Business connecté.");
         runInBackground("synchronisation du catalogue", () =>
           syncCatalog("connexion"),
@@ -973,10 +1012,12 @@ async function connectToWhatsApp() {
           scheduleReconnect();
         } else if (numericStatusCode === 440) {
           socket = undefined;
+          setWhatsAppPhase("session_conflict_440");
           logger.fatal(
             "Conflit de session (440). Reconnexion automatique désactivée; résolvez le conflit puis redémarrez le service.",
           );
         } else {
+          setWhatsAppPhase("logged_out");
           logger.fatal("WhatsApp a déconnecté la session. Effacement de l’authentification enregistrée.");
           void clearSupabaseAuthState()
             .catch((error) =>
@@ -1015,6 +1056,14 @@ async function connectToWhatsApp() {
         }
       }
     });
+  } catch (error) {
+    connectedAt = undefined;
+    setWhatsAppPhase("initialization_failed");
+    logger.error(
+      { err: safeErrorDetails(error) },
+      "Échec de l’initialisation WhatsApp; l’API reste active et une nouvelle tentative est planifiée.",
+    );
+    scheduleReconnect();
   } finally {
     connecting = false;
   }
@@ -1044,6 +1093,7 @@ async function shutdown(exitCode = 0) {
 }
 
 async function main() {
+  setWhatsAppPhase("http_starting");
   server.listen(PORT, "0.0.0.0", () =>
     logger.info({ port: PORT }, "API Gateway prête."),
   );

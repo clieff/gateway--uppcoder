@@ -18,6 +18,7 @@ const instancePrefix = `sessions/${Buffer.from(instanceId).toString("base64url")
  * d’aller-retours HTTP au démarrage ; il est migré une seule fois.
  */
 const statePath = `${instancePrefix}/state.json`;
+const LEGACY_READ_CONCURRENCY = 8;
 const FLUSH_DELAY_MS = Math.max(
   200,
   Number(process.env.SUPABASE_BAILEYS_FLUSH_MS || 1500),
@@ -59,7 +60,7 @@ function assertPrivateBucket(bucket) {
   }
 }
 
-async function setupBucket() {
+async function setupBucket(onProgress) {
   if (!/^[a-z0-9][a-z0-9._-]*$/i.test(bucketName)) {
     throw new Error("SUPABASE_BAILEYS_BUCKET contient un nom de bucket invalide.");
   }
@@ -67,16 +68,19 @@ async function setupBucket() {
     throw new Error("SUPABASE_BAILEYS_INSTANCE_ID ne peut pas être vide.");
   }
 
+  onProgress?.({ phase: "checking_storage_bucket" });
   const storage = supabase.storage;
   const { data: existingBucket, error: lookupError } =
     await storage.getBucket(bucketName);
 
   if (!lookupError) {
     assertPrivateBucket(existingBucket);
+    onProgress?.({ phase: "storage_bucket_ready" });
     return;
   }
   if (!isNotFound(lookupError)) throw lookupError;
 
+  onProgress?.({ phase: "creating_storage_bucket" });
   const { error: createError } = await storage.createBucket(bucketName, {
     public: false,
   });
@@ -86,11 +90,12 @@ async function setupBucket() {
     await storage.getBucket(bucketName);
   if (verifyError) throw createError || verifyError;
   assertPrivateBucket(createdBucket);
+  onProgress?.({ phase: "storage_bucket_ready" });
 }
 
-async function ensureBucket() {
+async function ensureBucket(onProgress) {
   if (!bucketSetup) {
-    bucketSetup = setupBucket().catch((error) => {
+    bucketSetup = setupBucket(onProgress).catch((error) => {
       bucketSetup = null;
       throw error;
     });
@@ -193,28 +198,52 @@ function parseLegacyKeyName(objectName) {
  * Migration unique depuis l’ancien format (un objet par clé). Sans elle, les
  * déploiements existants perdraient leur session et devraient ré-appairer.
  */
-async function migrateLegacyState() {
+async function migrateLegacyState(onProgress) {
+  onProgress?.({ phase: "listing_legacy_session_files" });
   const names = await listObjects(instancePrefix);
   const legacyNames = names.filter((name) => name !== "state.json");
+  onProgress?.({ phase: "legacy_session_files_listed", total: legacyNames.length });
   if (!legacyNames.length) return null;
 
+  onProgress?.({ phase: "reading_legacy_credentials" });
   const creds = await downloadJson(
     `${instancePrefix}/${Buffer.from("creds.json", "utf8").toString("base64url")}.json`,
   );
   if (!creds) return null;
 
   const keys = new Map();
-  for (const name of legacyNames) {
-    const parsed = parseLegacyKeyName(name);
-    if (!parsed) continue;
-    const value = await downloadJson(`${instancePrefix}/${name}`);
-    if (value != null) putKey(keys, parsed.type, parsed.id, value);
+  let completed = 0;
+  let restored = 0;
+  for (let offset = 0; offset < legacyNames.length; offset += LEGACY_READ_CONCURRENCY) {
+    const batch = legacyNames.slice(offset, offset + LEGACY_READ_CONCURRENCY);
+    const results = await Promise.all(
+      batch.map(async (name) => {
+        const parsed = parseLegacyKeyName(name);
+        if (!parsed) return null;
+        const value = await downloadJson(`${instancePrefix}/${name}`);
+        return value == null ? null : { ...parsed, value };
+      }),
+    );
+    for (const result of results) {
+      if (!result) continue;
+      putKey(keys, result.type, result.id, result.value);
+      restored += 1;
+    }
+    completed += batch.length;
+    onProgress?.({
+      phase: "reading_legacy_session_keys",
+      completed,
+      total: legacyNames.length,
+      restored,
+    });
   }
 
   const migrated = { creds, keys };
   // Le nouvel état est écrit AVANT la suppression des anciens objets : une
   // coupure entre les deux laisse toujours une session récupérable.
+  onProgress?.({ phase: "writing_migrated_session", restored });
   await uploadState(serialize(migrated));
+  onProgress?.({ phase: "migrated_session_written", restored });
 
   // Les anciens objets ne sont plus lus : on les retire pour éviter deux sources de vérité.
   try {
@@ -231,14 +260,19 @@ async function migrateLegacyState() {
   return migrated;
 }
 
-async function loadState() {
-  await ensureBucket();
+async function loadState(onProgress) {
+  await ensureBucket(onProgress);
+  onProgress?.({ phase: "reading_current_session" });
   const stored = await downloadJson(statePath);
-  if (stored) return hydrate(stored);
+  if (stored) {
+    onProgress?.({ phase: "current_session_loaded" });
+    return hydrate(stored);
+  }
 
-  const migrated = await migrateLegacyState();
+  const migrated = await migrateLegacyState(onProgress);
   if (migrated) return migrated;
 
+  onProgress?.({ phase: "creating_new_session" });
   return { creds: initAuthCreds(), keys: new Map() };
 }
 
@@ -307,13 +341,14 @@ export async function clearSupabaseAuthState() {
   }
 }
 
-export async function useSupabaseAuthState() {
+export async function useSupabaseAuthState({ onProgress } = {}) {
   if (!statePromise) {
-    statePromise = loadState()
+    statePromise = loadState(onProgress)
       .then((state) => {
         memoryState = state;
         // Première exécution : persiste tout de suite les creds initiaux.
         dirty = !state.keys.size;
+        onProgress?.({ phase: "session_ready", keyTypes: state.keys.size });
         return state;
       })
       .catch((error) => {
