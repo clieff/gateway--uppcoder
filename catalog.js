@@ -1,12 +1,15 @@
 import 'dotenv/config';
-import axios from 'axios';
+import { supabase } from './db.js';
 
 const BUSINESS_JID = process.env.BUSINESS_JID;
-const CATALOG_GRAPHQL_URL = 'https://graph.whatsapp.com/graphql/catalog';
-const CATALOG_ACCESS_TOKEN = process.env.WHATSAPP_CATALOG_ACCESS_TOKEN
-  || 'WA|787118555984857|7bb1544a3599aa180ac9a3f7688ba243';
-const CATALOG_QUERY_ID = process.env.WHATSAPP_CATALOG_QUERY_ID || '30445081048424116';
-const CATALOG_HTTP_TIMEOUT_MS = 8_000;
+const MAX_CATALOG_PRODUCTS = 50;
+const CATALOG_COLUMNS =
+  'id,title,description,price,currency,retailer_id,url,image_url';
+// Lecture du catalogue natif : 50 produits par page, 20 pages au maximum, et
+// 30 s d’attente par page (Baileys attend 60 s par défaut).
+const CATALOG_SYNC_PAGE_SIZE = 50;
+const CATALOG_SYNC_MAX_PAGES = 20;
+const CATALOG_SYNC_TIMEOUT_MS = 30_000;
 
 function normalizeJid(jid) {
   if (!jid) return '';
@@ -54,51 +57,147 @@ function normalizeProduct(product) {
 }
 
 /**
- * Lit le catalogue public via la requête HTTPS utilisée par WhatsApp Web.
- * sock.getCatalog() utilise l'ancienne requête w:biz:catalog qui expire sur
- * Baileys 7 RC lorsque WhatsApp ne répond plus à cette requête IQ.
+ * Lit le catalogue depuis la table public.products (source de vérité du bot).
+ * La requête graph.whatsapp.com/graphql/catalog utilisée par WhatsApp Web a été
+ * abandonnée : elle exige une instance authentifiée et renvoie field_exception
+ * pour ce compte, quel que soit le jeton fourni.
  */
 export async function getCatalogProducts() {
-  if (!BUSINESS_JID) throw new Error('BUSINESS_JID doit identifier le compte Business propriétaire du catalogue.');
+  const { data, error } = await supabase
+    .from('products')
+    .select(CATALOG_COLUMNS)
+    .eq('is_active', true)
+    .order('title', { ascending: true })
+    .limit(MAX_CATALOG_PRODUCTS);
 
-  const response = await axios.post(
-    CATALOG_GRAPHQL_URL,
-    {
-      access_token: CATALOG_ACCESS_TOKEN,
-      doc_id: CATALOG_QUERY_ID,
-      lang: 'en_US',
-      variables: {
-        request: {
-          product_catalog: {
-            jid: normalizeJid(BUSINESS_JID),
-            allow_shop_source: 'ALLOWSHOPSOURCE_TRUE',
-            width: '100',
-            height: '100',
-            limit: '50',
-            after: null,
-            catalog_session_id: null,
-            direct_connection_encrypted_info: null,
-            variant_info_fields: null,
-            variant_thumbnail_height: null,
-            variant_thumbnail_width: null,
-          },
-        },
-      },
-    },
-    {
-      timeout: CATALOG_HTTP_TIMEOUT_MS,
-      headers: { 'content-type': 'application/json' },
-    },
-  );
-
-  const catalog = response.data?.data?.xwa_product_catalog_get_product_catalog?.product_catalog;
-  if (!catalog) {
-    const graphQLError = response.data?.errors?.[0]?.message;
-    throw new Error(graphQLError || 'Réponse du catalogue WhatsApp invalide ou vide.');
+  if (error) {
+    throw new Error(`Lecture du catalogue Supabase impossible : ${error.message}`);
   }
 
-  const products = Array.isArray(catalog) ? catalog : catalog.products || [];
-  return products.map(normalizeProduct).filter(Boolean).slice(0, 50);
+  return (data || [])
+    .map((row) =>
+      normalizeProduct({
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        price: row.price,
+        currency: row.currency,
+        retailerId: row.retailer_id,
+        url: row.url,
+        imageUrl: row.image_url,
+      }),
+    )
+    .filter(Boolean)
+    .slice(0, MAX_CATALOG_PRODUCTS);
+}
+
+function toProductRow(product) {
+  return {
+    id: product.id,
+    title: product.title,
+    description: product.description || '',
+    price: product.price,
+    currency: product.currency || '',
+    retailer_id: product.retailerId || '',
+    url: product.url || '',
+    image_url: product.imageUrl || null,
+    is_active: true,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Lit le catalogue natif du compte Business via la requête w:biz:catalog de
+ * Baileys, puis l’enregistre dans public.products. Les produits absents du
+ * catalogue WhatsApp sont désactivés (is_active = false) au lieu d’être
+ * supprimés, et seulement si la pagination est allée au bout.
+ */
+export async function syncCatalogFromWhatsApp(
+  sock,
+  { businessJid = BUSINESS_JID } = {},
+) {
+  if (!businessJid) {
+    throw new Error('BUSINESS_JID doit identifier le compte Business propriétaire du catalogue.');
+  }
+  if (typeof sock?.getCatalog !== 'function') {
+    throw new Error('Cette version de Baileys ne propose pas la lecture du catalogue natif.');
+  }
+
+  const collected = [];
+  let cursor;
+  let complete = false;
+
+  for (let page = 0; page < CATALOG_SYNC_MAX_PAGES; page += 1) {
+    const result = await withTimeout(
+      sock.getCatalog({
+        jid: businessJid,
+        limit: CATALOG_SYNC_PAGE_SIZE,
+        cursor,
+      }),
+      CATALOG_SYNC_TIMEOUT_MS,
+      'Catalogue natif : WhatsApp n’a pas répondu dans le délai imparti.',
+    );
+    const products = Array.isArray(result?.products) ? result.products : [];
+    collected.push(...products);
+    cursor = result?.nextPageCursor;
+    if (!cursor) {
+      complete = true;
+      break;
+    }
+    if (!products.length) break;
+  }
+
+  const unique = new Map();
+  for (const product of collected.map(normalizeProduct).filter(Boolean)) {
+    unique.set(product.id, product);
+  }
+  const rows = [...unique.values()].map(toProductRow);
+
+  if (!rows.length) {
+    return { synced: 0, deactivated: 0, complete };
+  }
+
+  const { error: upsertError } = await supabase
+    .from('products')
+    .upsert(rows, { onConflict: 'id' });
+  if (upsertError) {
+    throw new Error(`Enregistrement du catalogue dans Supabase impossible : ${upsertError.message}`);
+  }
+
+  let deactivated = 0;
+  if (complete) {
+    const ids = new Set(rows.map((row) => row.id));
+    const { data: activeRows, error: readError } = await supabase
+      .from('products')
+      .select('id')
+      .eq('is_active', true);
+    if (readError) {
+      throw new Error(`Lecture des produits actifs impossible : ${readError.message}`);
+    }
+    const stale = (activeRows || [])
+      .map((row) => row.id)
+      .filter((id) => !ids.has(id));
+    if (stale.length) {
+      const { error: deactivateError } = await supabase
+        .from('products')
+        .update({ is_active: false, updated_at: new Date().toISOString() })
+        .in('id', stale);
+      if (deactivateError) {
+        throw new Error(`Désactivation des produits retirés impossible : ${deactivateError.message}`);
+      }
+      deactivated = stale.length;
+    }
+  }
+
+  return { synced: rows.length, deactivated, complete };
 }
 
 export async function sendProductCard(sock, jid, product, businessJid = BUSINESS_JID, message = '') {

@@ -19,6 +19,7 @@ import {
   sendCatalogLink,
   sendProductCard,
   sendProductList,
+  syncCatalogFromWhatsApp,
 } from "./catalog.js";
 
 function normalizeWebhookUrl(value) {
@@ -80,6 +81,7 @@ const NON_USER_MESSAGE_TYPES = new Set([
 ]);
 let socket;
 let reconnectTimer;
+let catalogSyncPromise = null;
 
 function safeErrorDetails(error) {
   const responseData = error?.response?.data;
@@ -205,10 +207,12 @@ async function refreshCatalog({ force = false } = {}) {
   const now = Date.now();
   if (!force && now - catalogCache.refreshedAt < 60_000)
     return catalogCache.products;
-  if (catalogCache.refreshPromise && catalogCache.refreshTimedOut) return [];
+  if (catalogCache.refreshPromise && catalogCache.refreshTimedOut)
+    return catalogCache.products;
 
   if (!catalogCache.refreshPromise) {
-    if (now < catalogCache.retryAfter) return catalogCache.products;
+    if (!force && now < catalogCache.retryAfter)
+      return catalogCache.products;
 
     const catalogRead = Promise.resolve()
       .then(() => getCatalogProducts())
@@ -237,7 +241,7 @@ async function refreshCatalog({ force = false } = {}) {
         catalogCache.refreshFailed = true;
         logger.warn(
           { err: safeErrorDetails(error), cachedProducts: catalogCache.products.length },
-          "Catalogue WhatsApp indisponible; le dernier cache est conservé.",
+          "Catalogue indisponible; le dernier cache est conservé.",
         );
         return catalogCache.products;
       })
@@ -270,12 +274,47 @@ async function refreshCatalog({ force = false } = {}) {
     catalogCache.refreshFailed = true;
     logger.warn(
       { cachedProducts: catalogCache.products.length },
-      "Catalogue > 3 s; Vercel reçoit le message sans catalogue, l’actualisation continue en arrière-plan.",
+      "Catalogue > 3 s; le dernier catalogue connu est utilisé, l’actualisation continue en arrière-plan.",
     );
-    return [];
+    return catalogCache.products;
   }
 
   return result;
+}
+
+async function syncCatalog(reason) {
+  if (catalogSyncPromise) return catalogSyncPromise;
+
+  catalogSyncPromise = (async () => {
+    try {
+      const result = await syncCatalogFromWhatsApp(socket, {
+        businessJid: BUSINESS_JID,
+      });
+      logger.info(
+        { ...result, reason },
+        "Catalogue natif WhatsApp synchronisé dans Supabase.",
+      );
+      if (result.synced) {
+        catalogCache.retryAfter = 0;
+        catalogCache.refreshFailed = false;
+      } else {
+        logger.warn(
+          { reason },
+          "Catalogue natif WhatsApp vide ou incomplet; les produits Supabase existants sont conservés.",
+        );
+      }
+    } catch (error) {
+      logger.warn(
+        { err: safeErrorDetails(error), reason },
+        "Synchronisation du catalogue natif impossible; les produits Supabase existants sont utilisés.",
+      );
+    } finally {
+      await refreshCatalog({ force: true });
+      catalogSyncPromise = null;
+    }
+  })();
+
+  return catalogSyncPromise;
 }
 
 async function saveInbound(message, jid) {
@@ -564,7 +603,7 @@ async function processLiveMessage(message, jid) {
       );
       return;
     }
-    if (catalogCache.refreshFailed && !catalogCache.refreshTimedOut) {
+    if (!products.length && catalogCache.refreshFailed) {
       await sendCatalogUnavailableNotice(jid);
       return;
     }
@@ -635,7 +674,7 @@ async function dispatchManualMessage(body) {
 
   if (body.type === "product_card") {
     const products = await refreshCatalog();
-    if (catalogCache.refreshFailed) {
+    if (!products.length && catalogCache.refreshFailed) {
       await sendCatalogUnavailableNotice(jid);
       return;
     }
@@ -660,7 +699,7 @@ async function dispatchManualMessage(body) {
   }
   if (body.type === "product_list") {
     const products = await refreshCatalog();
-    if (catalogCache.refreshFailed) {
+    if (!products.length && catalogCache.refreshFailed) {
       await sendCatalogUnavailableNotice(jid);
       return;
     }
@@ -812,7 +851,7 @@ async function connectToWhatsApp() {
     }
     if (connection === "open") {
       logger.info({ jid: socket.user?.id }, "WhatsApp Business connecté.");
-      void refreshCatalog({ force: true });
+      void syncCatalog("connexion");
     }
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
