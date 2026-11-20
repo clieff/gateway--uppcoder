@@ -9,7 +9,10 @@ const CATALOG_COLUMNS =
 // 30 s d’attente par page (Baileys attend 60 s par défaut).
 const CATALOG_SYNC_PAGE_SIZE = 50;
 const CATALOG_SYNC_MAX_PAGES = 20;
-const CATALOG_SYNC_TIMEOUT_MS = 30_000;
+// Ce compte Business ne reçoit souvent aucune réponse à l’IQ w:biz:catalog
+// (WhiskeySockets/Baileys#2717) : un délai court évite d’attendre 30 s pour rien
+// à chaque connexion avant de retomber sur le catalogue Supabase.
+const CATALOG_SYNC_TIMEOUT_MS = 10_000;
 // Taille des lots de la relecture des images existantes (limite d’URL PostgREST).
 const CATALOG_LOOKUP_CHUNK_SIZE = 100;
 
