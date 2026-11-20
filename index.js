@@ -22,6 +22,7 @@ import {
   getCatalogProducts,
   normalizeJid,
   sendCatalogLink,
+  sendCatalogProductCards,
   sendProductCard,
   sendProductList,
   syncCatalogFromWhatsApp,
@@ -612,6 +613,21 @@ async function sendAction(jid, action, products, { strict = false } = {}) {
   }
 
   if (action?.type === "catalog_link") {
+    // « Montre-moi le catalogue » : envoyer les photos des produits avec leur
+    // légende. Les fiches natives sont écartées (ids inconnus de WhatsApp) et le
+    // lien wa.me/c ne sert plus que de repli sans produit actif.
+    const cards = await sendCatalogProductCards(
+      socket,
+      jid,
+      products,
+      BUSINESS_JID,
+      message || "Voici notre catalogue.",
+    );
+    for (const { product, result, type } of cards) {
+      await saveOutbound(jid, result, `Fiche produit : ${product.title}`, type);
+    }
+    if (cards.length) return;
+
     const catalogUrl = businessLink(null, BUSINESS_JID) || "";
     const result = await sendCatalogLink(
       socket,

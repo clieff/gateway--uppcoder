@@ -254,6 +254,61 @@ export async function sendProductCard(sock, jid, product, businessJid = BUSINESS
   return sock.sendMessage(jid, content);
 }
 
+/** Légende d’une fiche : titre, description et prix, bornée à 1000 caractères. */
+function productCaption(product) {
+  return [product.title, product.description, formatPrice(product)]
+    .filter(Boolean)
+    .join('\n')
+    .slice(0, 1000);
+}
+
+/**
+ * Envoie le catalogue sous forme de photos avec légende. Les fiches natives
+ * (productMessage) sont écartées : leurs ids ne viennent pas du catalogue
+ * WhatsApp, qui peut alors ignorer la fiche sans renvoyer d’erreur. Le message
+ * image, lui, s’affiche toujours ; un produit sans photo part en texte.
+ * Renvoie un tableau `{ product, result, type }` pour la journalisation.
+ */
+export async function sendCatalogProductCards(
+  sock,
+  jid,
+  products,
+  businessJid = BUSINESS_JID,
+  message = 'Voici notre catalogue.',
+) {
+  const items = (products || [])
+    .map((product) => normalizeProduct(product) || product)
+    .filter((product) => product?.id && product?.title)
+    .slice(0, 5);
+
+  const sent = [];
+  for (const [index, product] of items.entries()) {
+    const intro = index === 0 ? String(message || '') : '';
+
+    if (!product.imageUrl) {
+      const text = [intro, productCaption(product)].filter(Boolean).join('\n');
+      sent.push({
+        product,
+        result: await sock.sendMessage(jid, { text }),
+        type: 'conversation',
+      });
+      continue;
+    }
+
+    const caption = [intro, productCaption(product)].filter(Boolean).join('\n');
+    sent.push({
+      product,
+      result: await sock.sendMessage(jid, {
+        image: { url: product.imageUrl },
+        caption,
+      }),
+      type: 'imageMessage',
+    });
+  }
+
+  return sent;
+}
+
 export async function sendProductList(sock, jid, products, message = 'Voici les produits correspondants.') {
   const items = (products || []).map((product) => normalizeProduct(product) || product)
     .filter((product) => product?.id && product?.title)
