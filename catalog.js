@@ -10,6 +10,8 @@ const CATALOG_COLUMNS =
 const CATALOG_SYNC_PAGE_SIZE = 50;
 const CATALOG_SYNC_MAX_PAGES = 20;
 const CATALOG_SYNC_TIMEOUT_MS = 30_000;
+// Taille des lots de la relecture des images existantes (limite d’URL PostgREST).
+const CATALOG_LOOKUP_CHUNK_SIZE = 100;
 
 function normalizeJid(jid) {
   if (!jid) return '';
@@ -102,6 +104,20 @@ export async function getCatalogProducts() {
     .slice(0, MAX_CATALOG_PRODUCTS);
 }
 
+/**
+ * Conserve l’image déjà enregistrée (bucket Supabase Storage ou saisie manuelle)
+ * quand le catalogue natif WhatsApp ne fournit pas d’image pour ce produit.
+ */
+function preserveExistingImages(rows, existingRows) {
+  const existing = new Map(
+    (existingRows || []).map((row) => [String(row.id), row.image_url || null]),
+  );
+  return rows.map((row) => ({
+    ...row,
+    image_url: row.image_url || existing.get(String(row.id)) || null,
+  }));
+}
+
 function toProductRow(product) {
   return {
     id: product.id,
@@ -127,9 +143,11 @@ function withTimeout(promise, ms, message) {
 
 /**
  * Lit le catalogue natif du compte Business via la requête w:biz:catalog de
- * Baileys, puis l’enregistre dans public.products. Les produits absents du
- * catalogue WhatsApp sont désactivés (is_active = false) au lieu d’être
- * supprimés, et seulement si la pagination est allée au bout.
+ * Baileys, puis l’enregistre dans public.products. La synchronisation est
+ * strictement additive : elle ne désactive jamais un produit, donc les produits
+ * saisis à la main restent actifs même s’ils sont absents du catalogue WhatsApp.
+ * De même, une image_url déjà enregistrée (bucket Supabase Storage) est
+ * conservée quand le produit natif n’en fournit pas.
  */
 export async function syncCatalogFromWhatsApp(
   sock,
@@ -176,42 +194,32 @@ export async function syncCatalogFromWhatsApp(
     return { synced: 0, productsWithImages: 0, deactivated: 0, complete };
   }
 
+  const ids = rows.map((row) => row.id);
+  const existingRows = [];
+  for (let index = 0; index < ids.length; index += CATALOG_LOOKUP_CHUNK_SIZE) {
+    const { data, error: readError } = await supabase
+      .from('products')
+      .select('id,image_url')
+      .in('id', ids.slice(index, index + CATALOG_LOOKUP_CHUNK_SIZE));
+    if (readError) {
+      throw new Error(`Lecture des images existantes impossible : ${readError.message}`);
+    }
+    existingRows.push(...(data || []));
+  }
+  const rowsToWrite = preserveExistingImages(rows, existingRows);
+
   const { error: upsertError } = await supabase
     .from('products')
-    .upsert(rows, { onConflict: 'id' });
+    .upsert(rowsToWrite, { onConflict: 'id' });
   if (upsertError) {
     throw new Error(`Enregistrement du catalogue dans Supabase impossible : ${upsertError.message}`);
   }
 
-  let deactivated = 0;
-  if (complete) {
-    const ids = new Set(rows.map((row) => row.id));
-    const { data: activeRows, error: readError } = await supabase
-      .from('products')
-      .select('id')
-      .eq('is_active', true);
-    if (readError) {
-      throw new Error(`Lecture des produits actifs impossible : ${readError.message}`);
-    }
-    const stale = (activeRows || [])
-      .map((row) => row.id)
-      .filter((id) => !ids.has(id));
-    if (stale.length) {
-      const { error: deactivateError } = await supabase
-        .from('products')
-        .update({ is_active: false, updated_at: new Date().toISOString() })
-        .in('id', stale);
-      if (deactivateError) {
-        throw new Error(`Désactivation des produits retirés impossible : ${deactivateError.message}`);
-      }
-      deactivated = stale.length;
-    }
-  }
-
+  // Aucun produit n’est jamais désactivé : la synchro n’est pas destructive.
   return {
-    synced: rows.length,
-    productsWithImages: rows.filter((row) => row.image_url).length,
-    deactivated,
+    synced: rowsToWrite.length,
+    productsWithImages: rowsToWrite.filter((row) => row.image_url).length,
+    deactivated: 0,
     complete,
   };
 }
@@ -283,5 +291,6 @@ export async function sendCatalogLink(sock, jid, businessJid = BUSINESS_JID, pro
   return sock.sendMessage(jid, { text });
 }
 
-// `normalizeProduct` et `formatPrice` sont exportés pour les tests unitaires.
-export { normalizeJid, normalizeProduct, formatPrice };
+// `normalizeProduct`, `formatPrice` et `preserveExistingImages` sont exportés
+// pour les tests unitaires.
+export { normalizeJid, normalizeProduct, formatPrice, preserveExistingImages };
