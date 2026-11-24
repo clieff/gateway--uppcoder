@@ -23,6 +23,8 @@ const FLUSH_DELAY_MS = Math.max(
   200,
   Number(process.env.SUPABASE_BAILEYS_FLUSH_MS || 1500),
 );
+const MAX_UPLOAD_ATTEMPTS = 3;
+const MAX_FLUSH_RETRY_DELAY_MS = 60_000;
 const KEY_TYPES = [
   "app-state-sync-key",
   "app-state-sync-version",
@@ -42,6 +44,23 @@ let memoryState;
 let dirty = false;
 let flushTimer;
 let writeChain = Promise.resolve();
+let flushRetryAttempt = 0;
+
+function isTransientStorageError(error) {
+  const message = String(error?.message || error);
+  const messageStatus = message.match(/\bHTTP\s+(\d{3})\b/i)?.[1];
+  const status = Number(
+    error?.statusCode || error?.status || error?.cause?.statusCode || error?.cause?.status,
+  ) || Number(messageStatus || 0);
+  if ([408, 425, 429].includes(status) || status >= 500) return true;
+  return /\b(?:fetch failed|network|timeout|timed out|ECONNRESET|ETIMEDOUT|EAI_AGAIN)\b/i.test(
+    message,
+  );
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function isNotFound(error) {
   return (
@@ -330,14 +349,23 @@ async function loadState(onProgress) {
 
 async function uploadState(payload = serialize(memoryState)) {
   await ensureBucket();
-  const { error } = await supabase.storage.from(bucketName).upload(statePath, payload, {
-    contentType: "application/json",
-    cacheControl: "0",
-    upsert: true,
-  });
-  if (error) {
-    throw new Error(`Écriture de session Supabase Storage impossible: ${error.message}`);
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt += 1) {
+    const { error } = await supabase.storage.from(bucketName).upload(statePath, payload, {
+      contentType: "application/json",
+      cacheControl: "0",
+      upsert: true,
+    });
+    if (!error) return;
+
+    lastError = error;
+    if (attempt === MAX_UPLOAD_ATTEMPTS || !isTransientStorageError(error)) break;
+    await wait(500 * 2 ** (attempt - 1));
   }
+  throw new Error(
+    `Écriture de session Supabase Storage impossible: ${lastError.message}`,
+    { cause: lastError },
+  );
 }
 
 async function flushNow() {
@@ -345,16 +373,27 @@ async function flushNow() {
   dirty = false;
   writeChain = writeChain
     .catch(() => undefined)
-    .then(() => uploadState())
+    .then(async () => {
+      await uploadState();
+      flushRetryAttempt = 0;
+    })
     .catch((error) => {
-      // Une écriture perdue laisse l’état sale : le prochain flush réessaiera.
+      // Garde l’état sale et retente, même si Baileys ne signale plus de changement.
       dirty = true;
+      if (isTransientStorageError(error)) {
+        flushRetryAttempt += 1;
+        const delay = Math.min(
+          FLUSH_DELAY_MS * 2 ** Math.min(flushRetryAttempt, 10),
+          MAX_FLUSH_RETRY_DELAY_MS,
+        );
+        scheduleFlush(delay);
+      }
       throw error;
     });
   return writeChain;
 }
 
-function scheduleFlush() {
+function scheduleFlush(delayMs = FLUSH_DELAY_MS) {
   if (flushTimer) return;
   flushTimer = setTimeout(() => {
     flushTimer = undefined;
