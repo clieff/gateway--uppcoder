@@ -7,7 +7,7 @@ process.env.SUPABASE_URL ||= "https://example.supabase.co";
 process.env.SUPABASE_SERVICE_ROLE_KEY ||= "test-service-role-key";
 process.env.BUSINESS_JID ||= "237600000000@s.whatsapp.net";
 
-const { normalizeProduct, formatPrice, preserveExistingImages, sendCatalogProductCards } =
+const { normalizeProduct, formatPrice, preserveExistingImages, sendCatalogProductCards, sendProductPhoto } =
   await import("../catalog.js");
 
 function plainSpace(value) {
@@ -168,4 +168,38 @@ test("sendCatalogProductCards envoie un texte pour un produit sans photo", async
     results.map(({ type }) => type),
     ["imageMessage", "conversation"],
   );
+});
+
+test("sendProductPhoto envoie la photo du produit choisi avec sa légende", async () => {
+  const sock = fakeSock();
+  await sendProductPhoto(
+    sock,
+    "237600000001@s.whatsapp.net",
+    CATALOG_ROWS[2],
+    "Parfait, voici le produit que vous avez choisi.",
+  );
+
+  assert.equal(sock.sent.length, 1);
+  assert.equal(sock.sent[0].content.image.url, "https://bucket/3.jpeg");
+  assert.match(sock.sent[0].content.caption, /^Parfait, voici le produit que vous avez choisi./);
+  assert.match(sock.sent[0].content.caption, /LAIT HYDRATANT ET RÉPARATEUR/);
+  assert.match(plainSpace(sock.sent[0].content.caption), /5 000 FCFA/);
+  // Jamais de fiche native : WhatsApp ignore ces ids et ne répondrait plus.
+  assert.equal(sock.sent[0].content.product, undefined);
+});
+
+test("sendProductPhoto envoie un texte quand le produit n’a pas de photo", async () => {
+  const sock = fakeSock();
+  await sendProductPhoto(
+    sock,
+    "237600000001@s.whatsapp.net",
+    { id: "sans-image", title: "Sans photo", price: 1000, currency: "FCFA" },
+    "Voici le produit.",
+  );
+
+  assert.equal(sock.sent.length, 1);
+  assert.equal(sock.sent[0].content.image, undefined);
+  assert.match(sock.sent[0].content.text, /^Voici le produit./);
+  assert.match(sock.sent[0].content.text, /Sans photo/);
+  assert.match(plainSpace(sock.sent[0].content.text), /1 000 FCFA/);
 });

@@ -227,31 +227,21 @@ export async function syncCatalogFromWhatsApp(
   };
 }
 
-export async function sendProductCard(sock, jid, product, businessJid = BUSINESS_JID, message = '') {
+/**
+ * Envoie un produit en photo avec sa légende (titre, description, prix).
+ * La fiche native (productMessage) n’est plus utilisée : ses ids ne viennent pas
+ * du catalogue WhatsApp, qui peut alors l’ignorer sans erreur et laisser le
+ * client sans réponse. Un produit sans photo part en texte.
+ */
+export async function sendProductPhoto(sock, jid, product, message = '') {
   const item = normalizeProduct(product) || product;
   if (!item?.id || !item?.title) throw new Error('Produit du catalogue incomplet : id et titre requis.');
-  if (!item.imageUrl) {
-    const digits = normalizeJid(businessJid).split('@')[0];
-    const link = digits ? `https://wa.me/p/${encodeURIComponent(item.id)}/${digits}` : item.url;
-    return sock.sendMessage(jid, { text: [message, link].filter(Boolean).join('\n') });
-  }
 
-  const content = {
-    product: {
-      productId: item.id,
-      title: item.title,
-      description: item.description || '',
-      ...(item.currency ? { currencyCode: item.currency } : {}),
-      ...(item.price == null ? {} : { priceAmount1000: Math.round(item.price * 1000) }),
-      ...(item.retailerId ? { retailerId: item.retailerId } : {}),
-      url: item.url || undefined,
-      productImage: { url: item.imageUrl },
-    },
-    businessOwnerJid: normalizeJid(businessJid),
-    body: message || undefined,
-  };
+  const intro = String(message || '').trim();
+  const caption = [intro, productCaption(item)].filter(Boolean).join('\n').slice(0, 1024);
+  if (!item.imageUrl) return sock.sendMessage(jid, { text: caption });
 
-  return sock.sendMessage(jid, content);
+  return sock.sendMessage(jid, { image: { url: item.imageUrl }, caption });
 }
 
 /** Légende d’une fiche : titre, description et prix, bornée à 1000 caractères. */
@@ -351,4 +341,10 @@ export async function sendCatalogLink(sock, jid, businessJid = BUSINESS_JID, pro
 
 // `normalizeProduct`, `formatPrice` et `preserveExistingImages` sont exportés
 // pour les tests unitaires.
-export { normalizeJid, normalizeProduct, formatPrice, preserveExistingImages };
+export {
+  normalizeJid,
+  normalizeProduct,
+  formatPrice,
+  preserveExistingImages,
+  productCaption,
+};

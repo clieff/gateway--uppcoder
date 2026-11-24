@@ -23,8 +23,8 @@ import {
   normalizeJid,
   sendCatalogLink,
   sendCatalogProductCards,
-  sendProductCard,
   sendProductList,
+  sendProductPhoto,
   syncCatalogFromWhatsApp,
 } from "./catalog.js";
 import {
@@ -106,6 +106,10 @@ const catalogCache = {
 };
 const replyQueues = new Map();
 const inboundQueues = new Map();
+// Derniers produits réellement envoyés à chaque contact : c’est ce qui permet
+// au cerveau de résoudre « celui-ci » ou « je veux le dernier ».
+const shownProductsByJid = new Map();
+const MAX_SHOWN_PRODUCTS = 5;
 const recentInboundMessageIds = new Map();
 const INBOUND_MESSAGE_DEDUP_TTL_MS = 10 * 60_000;
 const MAX_RECENT_INBOUND_MESSAGE_IDS = 5_000;
@@ -219,6 +223,14 @@ function getSelectedProductId(message) {
     }
   }
   return null;
+}
+
+function rememberShownProducts(jid, products) {
+  const ids = (products || [])
+    .map((product) => String(product?.id ?? ""))
+    .filter(Boolean)
+    .slice(-MAX_SHOWN_PRODUCTS);
+  if (ids.length) shownProductsByJid.set(jid, ids);
 }
 
 function isDirectChat(jid) {
@@ -505,18 +517,18 @@ async function sendAction(jid, action, products, { strict = false } = {}) {
       await saveOutbound(jid, sent, text, "conversation");
       return;
     }
-    const result = await sendProductCard(
+    const result = await sendProductPhoto(
       socket,
       jid,
       product,
-      BUSINESS_JID,
-      message,
+      message || "Voici le produit que vous avez choisi.",
     );
+    rememberShownProducts(jid, [product]);
     await saveOutbound(
       jid,
       result,
       `Fiche produit : ${product.title}`,
-      product.imageUrl ? "productMessage" : "conversation",
+      product.imageUrl ? "imageMessage" : "conversation",
     );
     return;
   }
@@ -582,18 +594,17 @@ async function sendAction(jid, action, products, { strict = false } = {}) {
     let sentCount = 0;
     for (const [index, product] of chosen.entries()) {
       try {
-        const result = await sendProductCard(
+        const result = await sendProductPhoto(
           socket,
           jid,
           product,
-          BUSINESS_JID,
           index === 0 ? message || "Voici quelques produits avec leurs photos." : "",
         );
         await saveOutbound(
           jid,
           result,
           `Fiche produit : ${product.title}`,
-          "productMessage",
+          product.imageUrl ? "imageMessage" : "conversation",
         );
         sentCount += 1;
       } catch (error) {
@@ -626,7 +637,13 @@ async function sendAction(jid, action, products, { strict = false } = {}) {
     for (const { product, result, type } of cards) {
       await saveOutbound(jid, result, `Fiche produit : ${product.title}`, type);
     }
-    if (cards.length) return;
+    if (cards.length) {
+      rememberShownProducts(
+        jid,
+        cards.map(({ product }) => product),
+      );
+      return;
+    }
 
     const catalogUrl = businessLink(null, BUSINESS_JID) || "";
     const result = await sendCatalogLink(
@@ -693,6 +710,7 @@ async function requestBrainReply(jid, job) {
         messageId: job.messageId,
         message: job.content,
         catalogProducts: publicProducts,
+        lastShownProducts: shownProductsByJid.get(jid) || [],
       },
       {
         timeout: WEBHOOK_TIMEOUT_MS,
@@ -834,18 +852,18 @@ async function processLiveMessage(message, jid) {
     const products = await refreshCatalog();
     const product = products.find((item) => item.id === selectedProductId);
     if (product) {
-      const result = await sendProductCard(
+      const result = await sendProductPhoto(
         socket,
         jid,
         product,
-        BUSINESS_JID,
-        "Voici la fiche du produit sélectionné.",
+        "Voici le produit sélectionné. Souhaitez-vous passer commande ?",
       );
+      rememberShownProducts(jid, [product]);
       await saveOutbound(
         jid,
         result,
         `Fiche produit : ${product.title}`,
-        "productMessage",
+        product.imageUrl ? "imageMessage" : "conversation",
       );
       return;
     }
